@@ -36,7 +36,11 @@ def heavy_collatz(n):
         steps_total += steps
     return steps_total
 
-def quick_collatz(n):
+def quick_collatz(n: int) -> int:
     if n % 2 == 0:
         return n // 2
     return 3 * n + 1
+
+def float_math(x: float) -> float:
+    return x * 1.5 + 0.5
+

@@ -29,10 +29,8 @@ def test_hyperfunctions():
     assert result == expected
     # In a truly parallel scenario, hyperfunctions time should be less than standard map time
     # on a multi-core machine.
-    if end - start < end2 - start2:
-        print("Parallelism achieved!")
-    else:
-        print("Parallelism not obvious (might be due to small input or overhead)")
+    assert end - start < end2 - start2, "Parallelism not achieved!"
+    print("Parallelism achieved!")
 
 if __name__ == "__main__":
     test_hyperfunctions()

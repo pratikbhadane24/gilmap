@@ -14,22 +14,22 @@ from _hyperfunctions import execute, shutdown_workers
 
 atexit.register(shutdown_workers)
 
-def map(func: Callable[[int], int], iterable: Iterable[int] | pa.Array) -> list[int] | pa.Array:
-    """Execute a module-level Python callable over integer data in parallel.
+def map(func: Callable, iterable: Iterable | pa.Array) -> list | pa.Array:
+    """Execute a module-level Python callable over integer/float data in parallel.
 
     The function must be importable by module/name from worker sub-interpreters.
     To enforce this, lambdas, local functions, and functions defined in
     ``__main__`` are rejected.
 
     Args:
-        func: Callable that accepts one integer and returns one integer.
-        iterable: Iterable of integers or a PyArrow array castable to ``int64``.
+        func: Callable that accepts one integer/float and returns one integer/float.
+        iterable: Iterable of integers/floats or a PyArrow array castable to ``int64`` or ``float64``.
 
     Returns:
-        A ``list[int]`` if an iterable was passed, or a ``pyarrow.Array`` if a PyArrow array was passed, preserving input order.
+        A ``list`` if an iterable was passed, or a ``pyarrow.Array`` if a PyArrow array was passed, preserving input order.
 
     Raises:
-        TypeError: If ``func`` is not callable or input is not integer-castable.
+        TypeError: If ``func`` is not callable or input is not castable.
         ValueError: If ``func`` is a lambda/local function or defined in ``__main__``.
         RuntimeError: If worker execution fails in Rust/Python workers.
     """
@@ -56,12 +56,17 @@ def map(func: Callable[[int], int], iterable: Iterable[int] | pa.Array) -> list[
         iterable = pa.array(iterable)
         return_list = True
         
-    if not pa.types.is_int64(iterable.type):
+    if pa.types.is_float64(iterable.type) or pa.types.is_float32(iterable.type):
+        try:
+            iterable = iterable.cast(pa.float64())
+        except pa.ArrowInvalid:
+            raise TypeError("hyperfunctions.map cannot cast input to float64.")
+    else:
         try:
             # Attempt to cast to int64 if it's not already
             iterable = iterable.cast(pa.int64())
         except pa.ArrowInvalid:
-            raise TypeError("hyperfunctions.map currently only supports arrays of integers.")
+            raise TypeError("hyperfunctions.map currently only supports arrays of integers or floats.")
 
     # Call the Rust execution engine
     # execute() will spawn sub-interpreters and run the function
@@ -74,4 +79,4 @@ def map(func: Callable[[int], int], iterable: Iterable[int] | pa.Array) -> list[
             return result_array.to_pylist()
         return result_array
         
-    return [] if return_list else pa.array([], type=pa.int64())
+    return [] if return_list else pa.array([])

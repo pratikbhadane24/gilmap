@@ -7,7 +7,7 @@ import os
 # Ensure the tests directory is in sys.path so 'tasks' can be imported
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
-from tasks import count_primes, heavy_collatz, quick_collatz
+from tasks import count_primes, heavy_collatz, quick_collatz, float_math
 
 def run_benchmark(name, func, args):
     print(f"--- Benchmark: {name} ---")
@@ -81,3 +81,20 @@ if __name__ == "__main__":
     s = time.time()
     _ = hyperfunctions.map(quick_collatz, arrow_args)
     print(f"Hyperfunctions (overhead, arrow): {time.time() - s:.4f}s")
+    
+    # Test 4: Float Computation
+    print("--- Float Computation ---")
+    float_args = [float(x) for x in range(1, 1_000_000)]
+    
+    s = time.time()
+    _ = list(map(float_math, float_args))
+    print(f"Standard map (float): {time.time() - s:.4f}s")
+
+    s = time.time()
+    _ = hyperfunctions.map(float_math, float_args)
+    print(f"Hyperfunctions (float, list): {time.time() - s:.4f}s")
+
+    arrow_float_args = pa.array(float_args)
+    s = time.time()
+    _ = hyperfunctions.map(float_math, arrow_float_args)
+    print(f"Hyperfunctions (float, arrow): {time.time() - s:.4f}s")
