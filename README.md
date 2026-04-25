@@ -1,52 +1,46 @@
 # hyperfunctions
 
-`hyperfunctions` is a hybrid Python + Rust library that runs Python callables over integer data in parallel using:
+`hyperfunctions` is a Python + Rust parallel map runtime for numeric, single-argument, module-level Python functions.
 
-- Rust threads for CPU-level concurrency
-- Python sub-interpreters (Python 3.12+) so each worker can execute Python code independently
-- Apache Arrow for efficient data movement between Python and Rust
+It combines:
 
-At the Python level, the library exposes one function: `hyperfunctions.map`.
+- Rust worker threads for CPU parallelism
+- Python sub-interpreters (one per worker thread)
+- Apache Arrow arrays for efficient Python <-> Rust transfer
 
-## What problem this solves
+The public API is one function: `hyperfunctions.map`.
 
-`hyperfunctions.map` is designed for CPU-bound, pure-ish functions that are expensive enough to benefit from parallel execution. It provides a familiar `map`-style API while offloading scheduling and execution to a Rust backend.
+## What it is optimized for
 
-## Current feature scope
+`hyperfunctions.map` is best for **CPU-bound** functions where each element does enough work to amortize scheduling/conversion overhead.
 
-The current implementation is intentionally narrow:
+It is usually a poor fit for:
 
-- Input values are limited to integers (`int64` in Arrow)
-- The mapped function must be importable from a real module
-- The mapped function must return an integer (`i64`-extractable value)
-- Output is returned as a Python `list[int]`
+- tiny per-element work (overhead dominates)
+- I/O-bound callables
+- lambdas/local functions/not-importable functions
 
-This keeps cross-interpreter execution predictable and minimizes serialization complexity.
-
-## Installation
-
-### Prerequisites
+## Requirements
 
 - Python `>= 3.12`
-- Rust toolchain (`rustup`, `cargo`)
-- `maturin` (build backend)
+- Rust toolchain (`cargo`, `rustc`)
+- `maturin`
 - `pyarrow`
 
-### Local development install
+## Install (local development)
 
 ```bash
-# from repository root
 python -m venv .venv
 source .venv/bin/activate
 pip install -U pip maturin pyarrow pytest
 maturin develop
 ```
 
-`maturin develop` compiles the Rust extension (`_hyperfunctions`) and installs the Python package in editable mode.
+`maturin develop` builds and installs the `_hyperfunctions` extension for the active environment.
 
 ## Quick start
 
-`hyperfunctions.map` requires a module-level function (not a lambda or locally nested function).
+### Integer input
 
 ```python
 # tasks.py
@@ -59,144 +53,174 @@ def square(x: int) -> int:
 import hyperfunctions
 from tasks import square
 
-result = hyperfunctions.map(square, [1, 2, 3, 4])
-print(result)  # [1, 4, 9, 16]
+out = hyperfunctions.map(square, [1, 2, 3, 4])
+print(out)  # [1, 4, 9, 16]
+```
+
+### Float input
+
+```python
+def affine(x: float) -> float:
+    return x * 1.5 + 0.5
+
+print(hyperfunctions.map(affine, [1.0, 2.0, 3.0]))
+```
+
+### Arrow input (Arrow output)
+
+```python
+import pyarrow as pa
+import hyperfunctions
+from tasks import square
+
+arr = pa.array([1, 2, 3, 4], type=pa.int64())
+out = hyperfunctions.map(square, arr)
+print(type(out))  # pyarrow.Array
 ```
 
 ## API reference
 
-### `hyperfunctions.map(func, iterable) -> list[int]`
+### `hyperfunctions.map(func, iterable) -> list | pyarrow.Array`
 
-Executes `func` over `iterable` in parallel.
+Executes `func` over `iterable` in parallel while preserving element order.
 
-### Parameters
+#### Parameters
 
-- `func`: callable taking one integer argument and returning an integer
-- `iterable`: either:
-  - a Python iterable of integer-like values, or
-  - a `pyarrow.Array` that is already `int64` (or castable to it)
+- `func`: callable accepting one numeric argument and returning one numeric value
+- `iterable`: either
+  - a Python iterable of values castable to `int64` or `float64`, or
+  - a `pyarrow.Array`
 
-### Returns
+#### Return behavior
 
-- `list[int]` containing one result per input element, in input order
+- If input is a Python iterable: returns a Python `list`
+- If input is a `pyarrow.Array`: returns a `pyarrow.Array`
 
-### Raised exceptions
+#### Type behavior
 
-| Exception | When it is raised |
+- Float input (`float32`/`float64`) is cast to `float64`
+- Non-float input is cast to `int64`
+- Callable return values are converted back to the active numeric lane:
+  - integer lane -> `i64` conversion
+  - float lane -> `f64` conversion
+
+## Callable constraints
+
+Workers import by module + function name inside sub-interpreters. Because of that:
+
+- lambdas are rejected
+- local/nested functions are rejected
+- functions defined directly in `__main__` are rejected
+
+Put callables in importable modules (for example `tasks.py`) and import them in your entrypoint.
+
+## Error model
+
+| Exception | Condition |
 | --- | --- |
 | `TypeError` | `func` is not callable |
-| `ValueError` | `func` is a lambda |
-| `ValueError` | `func` is a local/nested function |
-| `ValueError` | `func.__module__ == "__main__"` |
-| `TypeError` | input cannot be represented/cast as `int64` |
-| `RuntimeError` | worker thread/interpreter execution fails |
+| `ValueError` | lambda/local function/`__main__` function used |
+| `TypeError` | input cannot be cast to supported numeric Arrow type |
+| `RuntimeError` | execution/import failure in worker sub-interpreters |
 
-## Function constraints and why they exist
-
-The backend imports your function by module and name inside each sub-interpreter:
-
-1. It reads `func.__module__` and `func.__name__`
-2. Worker interpreters import that module
-3. Workers resolve and invoke the function by attribute lookup
-
-Because of that:
-
-- **No lambda** (`__name__ == "<lambda>"`)
-- **No local function** (`"<locals>"` appears in `__qualname__`)
-- **No direct `__main__` functions** (sub-interpreters cannot reliably import your script entrypoint module by that name)
-
-If needed, move your function into a separate module (for example `tasks.py`) and import it in your main script.
-
-## Data model and type conversion
-
-The Python wrapper normalizes input into Arrow:
-
-1. Non-Arrow iterables are converted with `pa.array(...)`
-2. Arrays are cast to `pa.int64()` when possible
-3. Non-castable input raises `TypeError`
-
-The Rust backend:
-
-1. Converts PyArrow input to Arrow `Int64Array`
-2. Splits values into chunks based on available parallelism
-3. Executes chunk work in Rust threads + Python sub-interpreters
-4. Builds an Arrow `Int64Array` from results
-
-The Python wrapper converts the resulting Arrow array back to a plain list.
+If any worker fails, the whole call fails and no partial result is returned.
 
 ## Architecture
 
 ### Python layer (`hyperfunctions/__init__.py`)
 
-- Validates callable restrictions
-- Converts/casts input to Arrow `int64`
-- Passes module name, function name, input array, and `sys.path` into Rust
-- Converts result array to `list[int]`
+1. Validates callable constraints
+2. Converts/casts input to Arrow (`int64` or `float64`)
+3. Calls Rust extension entrypoint `execute(module_name, func_name, array, sys.path)`
+4. Converts result to list when original input was not Arrow
+5. Registers `shutdown_workers` with `atexit` for clean worker teardown
 
-### Rust extension (`src/lib.rs`)
+### Rust layer (`src/lib.rs`)
 
-- Exposes `_hyperfunctions.execute(...)` via PyO3
-- Deserializes PyArrow input into Arrow array
-- Determines worker count using `available_parallelism()`
-- Uses `std::thread::scope` for chunk workers
-- Creates one Python sub-interpreter per worker with `Py_NewInterpreterFromConfig`
-- Appends incoming `sys.path` entries in each worker interpreter
-- Imports module and calls target function for each value
-- Ends each sub-interpreter with `Py_EndInterpreter`
-- Returns result array to Python
+1. Lazily initializes a global worker pool (`OnceLock`) on first call
+2. Starts one thread per `available_parallelism()`
+3. Creates one Python sub-interpreter per worker thread
+4. Receives chunked tasks over MPSC channel
+5. Caches imported function objects per worker (`(module_name, func_name)` key)
+6. Extends worker `sys.path` from caller-provided entries
+7. Executes function for each value in the chunk
+8. Signals completion via `Condvar`
+9. Reassembles chunked output into Arrow array and returns to Python
+
+## Worker lifecycle and shutdown
+
+- Worker threads/sub-interpreters are long-lived after first use
+- They are reused across `hyperfunctions.map` calls
+- `shutdown_workers` sends one shutdown message per worker and joins threads
+- `shutdown_workers` is automatically called at process exit via `atexit`
+
+## Testing
+
+```bash
+# Rust checks
+cargo clippy --all-targets --all-features
+cargo test
+
+# Python tests (after maturin develop)
+python -m pytest -q
+```
+
+## Benchmarking
+
+Benchmark harnesses are included in `tests/test_heavy.py` and `tests/test_parallel.py`.
+
+### Benchmark workloads in repo
+
+| Workload | Function(s) | Goal |
+| --- | --- | --- |
+| Prime counting | `count_primes` | CPU-heavy integer compute |
+| Heavy collatz | `heavy_collatz` | Long iterative integer compute |
+| Overhead stress | `quick_collatz` over ~1M values | Measures framework overhead on light compute |
+| Float pipeline | `float_math` over ~1M values | Float path behavior + Arrow/list input comparison |
+
+### Run benchmark suite
+
+```bash
+source .venv/bin/activate
+python tests/test_heavy.py
+```
+
+The script prints timings for:
+
+- standard `map`
+- `multiprocessing.Pool.map`
+- `hyperfunctions.map` with list input
+- `hyperfunctions.map` with Arrow input (for overhead/float cases)
+
+### Interpreting results
+
+- Expect strongest wins on CPU-heavy tasks with enough per-element work.
+- For tiny operations, plain `map` can be faster due to lower overhead.
+- Arrow input often reduces conversion overhead versus list input for large arrays.
+- Compare against `multiprocessing` on your target machine; winner depends on workload shape and IPC cost.
+
+## Known limitations
+
+- Single-argument callables only
+- Numeric lanes only (`int64` / `float64`)
+- Callable must be importable by module + name (no lambda/local/`__main__`)
+- Null handling in input arrays is not currently modeled as nullable output semantics
 
 ## Repository layout
 
 ```text
 .
-├── Cargo.toml                  # Rust crate metadata and dependencies
-├── pyproject.toml              # Python package metadata (maturin backend)
-├── src/lib.rs                  # Rust execution engine exposed to Python
-├── hyperfunctions/__init__.py  # Public Python API wrapper
-├── tests/
-│   ├── tasks.py                # Test task functions
-│   ├── test_parallel.py        # Basic correctness/perf comparison test
-│   ├── test_safety.py          # Validation and error propagation tests
-│   └── test_heavy.py           # Manual benchmark-style script
-└── .github/workflows/CI.yml    # Multi-platform wheel/sdist build pipeline
+├── Cargo.toml
+├── pyproject.toml
+├── src/lib.rs
+├── hyperfunctions/__init__.py
+└── tests/
+    ├── tasks.py
+    ├── test_parallel.py
+    ├── test_safety.py
+    └── test_heavy.py
 ```
-
-## Running tests
-
-Use the project virtual environment when available:
-
-```bash
-.venv/bin/python -m pytest -q
-```
-
-Rust compile check/tests:
-
-```bash
-cargo test
-```
-
-## Performance notes
-
-- Best for CPU-heavy functions where work per element dominates overhead.
-- For very small or trivial functions, setup and conversion overhead can outweigh benefits.
-- Performance characteristics depend on:
-  - number of CPU cores
-  - cost variance across input elements
-  - module import/function call overhead in worker interpreters
-
-## Error propagation model
-
-If a mapped Python function raises inside a worker interpreter, the backend returns a `RuntimeError` to the caller with a worker-thread error message. This fails the whole `map` call; partial results are not returned.
 
 ## CI and packaging
 
-The GitHub Actions workflow (generated by maturin) builds wheels for Linux, musllinux, Windows, and macOS targets, plus source distributions. Tagged builds are configured for publication.
-
-## Known limitations
-
-- Integer-only input/output (`int64`)
-- Single-argument mapped function shape
-- No lambda/local/`__main__` functions
-- Return values must be integer-extractable in Rust (`i64`)
-
-These constraints reflect the current implementation and can be expanded in future versions.
+The GitHub Actions workflow builds wheels/sdists for multiple platforms using maturin.

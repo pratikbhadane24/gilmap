@@ -1,11 +1,16 @@
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
-use pyo3::prelude::*;
-use pyo3::ffi::*;
-use arrow::array::{Array, Int64Array, Float64Array, make_array};
+use arrow::array::{Array, Float64Array, Int64Array, make_array};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
-use std::sync::mpsc::{channel, Sender, Receiver};
-use std::sync::{Arc, Mutex, Condvar, OnceLock};
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::ffi::*;
+use pyo3::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{Sender, channel};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+type TaskResult = Result<(), String>;
+type TaskDone = Arc<(Mutex<Option<TaskResult>>, Condvar)>;
+type WorkerHandle = std::sync::Mutex<Option<std::thread::JoinHandle<()>>>;
+type WorkerPool = (Sender<WorkerMessage>, Vec<WorkerHandle>);
 
 #[derive(Clone, Copy)]
 enum DataType {
@@ -27,7 +32,7 @@ struct Task {
     sys_path: Vec<String>,
     data: DataType,
     len: usize,
-    done: Arc<(Mutex<Option<Result<(), String>>>, Condvar)>,
+    done: TaskDone,
 }
 
 unsafe impl Send for Task {}
@@ -37,14 +42,16 @@ enum WorkerMessage {
     Shutdown,
 }
 
-static WORKER_POOL: OnceLock<(Sender<WorkerMessage>, Vec<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>)> = OnceLock::new();
+static WORKER_POOL: OnceLock<WorkerPool> = OnceLock::new();
 
-fn init_worker_pool() -> (Sender<WorkerMessage>, Vec<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>) {
-    let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+fn init_worker_pool() -> WorkerPool {
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     let (tx, rx) = channel::<WorkerMessage>();
     let rx = Arc::new(Mutex::new(rx));
     let mut pool = Vec::new();
-    
+
     for _ in 0..num_threads {
         let rx_clone = rx.clone();
         let handle = std::thread::spawn(move || {
@@ -81,17 +88,21 @@ fn init_worker_pool() -> (Sender<WorkerMessage>, Vec<std::sync::Mutex<Option<std
                         Ok(WorkerMessage::Task(task)) => {
                             let thread_exec_result: Result<(), String> = Python::attach(|py_sub| {
                                 let mut execute_inner = || -> PyResult<()> {
-                                    let func_obj = if let Some(func) = func_cache.get(&(task.module_name.clone(), task.func_name.clone())) {
+                                    let func_obj = if let Some(func) = func_cache
+                                        .get(&(task.module_name.clone(), task.func_name.clone()))
+                                    {
                                         func.clone_ref(py_sub)
                                     } else {
                                         let sys = py_sub.import("sys")?;
                                         let path = sys.getattr("path")?;
-                                        
+
                                         // Add missing sys.paths for the task efficiently (O(1) checks locally)
                                         for p in &task.sys_path {
                                             if !path_set.contains(p) {
                                                 let p_str = p.as_str();
-                                                let contains = path.call_method1("__contains__", (p_str,))?.extract::<bool>()?;
+                                                let contains = path
+                                                    .call_method1("__contains__", (p_str,))?
+                                                    .extract::<bool>()?;
                                                 if !contains {
                                                     path.call_method1("append", (p_str,))?;
                                                 }
@@ -102,79 +113,96 @@ fn init_worker_pool() -> (Sender<WorkerMessage>, Vec<std::sync::Mutex<Option<std
                                         let module = py_sub.import(task.module_name.as_str())?;
                                         let func = module.getattr(task.func_name.as_str())?;
                                         let func_obj = func.unbind();
-                                        func_cache.insert((task.module_name.clone(), task.func_name.clone()), func_obj.clone_ref(py_sub));
+                                        func_cache.insert(
+                                            (task.module_name.clone(), task.func_name.clone()),
+                                            func_obj.clone_ref(py_sub),
+                                        );
                                         func_obj
                                     };
 
                                     let func_ptr = func_obj.as_ptr();
 
                                     match task.data {
-                                        DataType::Int64 { input_ptr, output_ptr } => {
-                                            let input_slice = std::slice::from_raw_parts(input_ptr, task.len);
-                                            let output_slice = std::slice::from_raw_parts_mut(output_ptr, task.len);
+                                        DataType::Int64 {
+                                            input_ptr,
+                                            output_ptr,
+                                        } => {
+                                            let input_slice =
+                                                std::slice::from_raw_parts(input_ptr, task.len);
+                                            let output_slice = std::slice::from_raw_parts_mut(
+                                                output_ptr, task.len,
+                                            );
 
                                             for j in 0..task.len {
                                                 let val = input_slice[j];
-                                                
-                                                unsafe {
-                                                    let val_obj = PyLong_FromLongLong(val as std::os::raw::c_longlong);
-                                                    if val_obj.is_null() {
-                                                        return Err(PyErr::fetch(py_sub));
-                                                    }
-                                                    
-                                                    let res_obj = PyObject_CallOneArg(func_ptr, val_obj);
-                                                    Py_DECREF(val_obj);
-                                                    
-                                                    if res_obj.is_null() {
-                                                        return Err(PyErr::fetch(py_sub));
-                                                    }
-                                                    
-                                                    let res_i64 = PyLong_AsLongLong(res_obj);
-                                                    Py_DECREF(res_obj);
-                                                    
-                                                    if res_i64 == -1 && !PyErr_Occurred().is_null() {
-                                                        return Err(PyErr::fetch(py_sub));
-                                                    }
-                                                    
-                                                    output_slice[j] = res_i64 as i64;
+
+                                                let val_obj = PyLong_FromLongLong(
+                                                    val as std::os::raw::c_longlong,
+                                                );
+                                                if val_obj.is_null() {
+                                                    return Err(PyErr::fetch(py_sub));
                                                 }
+
+                                                let res_obj =
+                                                    PyObject_CallOneArg(func_ptr, val_obj);
+                                                Py_DECREF(val_obj);
+
+                                                if res_obj.is_null() {
+                                                    return Err(PyErr::fetch(py_sub));
+                                                }
+
+                                                let res_i64 = PyLong_AsLongLong(res_obj);
+                                                Py_DECREF(res_obj);
+
+                                                if res_i64 == -1 && !PyErr_Occurred().is_null() {
+                                                    return Err(PyErr::fetch(py_sub));
+                                                }
+
+                                                output_slice[j] = res_i64 as i64;
                                             }
-                                        },
-                                        DataType::Float64 { input_ptr, output_ptr } => {
-                                            let input_slice = std::slice::from_raw_parts(input_ptr, task.len);
-                                            let output_slice = std::slice::from_raw_parts_mut(output_ptr, task.len);
+                                        }
+                                        DataType::Float64 {
+                                            input_ptr,
+                                            output_ptr,
+                                        } => {
+                                            let input_slice =
+                                                std::slice::from_raw_parts(input_ptr, task.len);
+                                            let output_slice = std::slice::from_raw_parts_mut(
+                                                output_ptr, task.len,
+                                            );
 
                                             for j in 0..task.len {
                                                 let val = input_slice[j];
-                                                
-                                                unsafe {
-                                                    let val_obj = PyFloat_FromDouble(val as std::os::raw::c_double);
-                                                    if val_obj.is_null() {
-                                                        return Err(PyErr::fetch(py_sub));
-                                                    }
-                                                    
-                                                    let res_obj = PyObject_CallOneArg(func_ptr, val_obj);
-                                                    Py_DECREF(val_obj);
-                                                    
-                                                    if res_obj.is_null() {
-                                                        return Err(PyErr::fetch(py_sub));
-                                                    }
-                                                    
-                                                    let res_f64 = PyFloat_AsDouble(res_obj);
-                                                    Py_DECREF(res_obj);
-                                                    
-                                                    if res_f64 == -1.0 && !PyErr_Occurred().is_null() {
-                                                        return Err(PyErr::fetch(py_sub));
-                                                    }
-                                                    
-                                                    output_slice[j] = res_f64 as f64;
+
+                                                let val_obj = PyFloat_FromDouble(
+                                                    val as std::os::raw::c_double,
+                                                );
+                                                if val_obj.is_null() {
+                                                    return Err(PyErr::fetch(py_sub));
                                                 }
+
+                                                let res_obj =
+                                                    PyObject_CallOneArg(func_ptr, val_obj);
+                                                Py_DECREF(val_obj);
+
+                                                if res_obj.is_null() {
+                                                    return Err(PyErr::fetch(py_sub));
+                                                }
+
+                                                let res_f64 = PyFloat_AsDouble(res_obj);
+                                                Py_DECREF(res_obj);
+
+                                                if res_f64 == -1.0 && !PyErr_Occurred().is_null() {
+                                                    return Err(PyErr::fetch(py_sub));
+                                                }
+
+                                                output_slice[j] = res_f64 as f64;
                                             }
                                         }
                                     }
                                     Ok(())
                                 };
-                                
+
                                 match execute_inner() {
                                     Ok(_) => Ok(()),
                                     Err(e) => Err(format!("Python error in worker thread: {}", e)),
@@ -210,27 +238,31 @@ fn execute<'py>(
 
     let array_data = arrow::array::ArrayData::from_pyarrow_bound(&array)
         .map_err(|e| PyValueError::new_err(format!("Failed to parse Arrow array: {}", e)))?;
-        
+
     let arrow_array = make_array(array_data);
     let len = arrow_array.len();
-    
+
     let is_float = arrow_array.data_type() == &arrow::datatypes::DataType::Float64;
-    
-    let chunk_size = if len == 0 { 1 } else { (len + num_threads - 1) / num_threads };
+
+    let chunk_size = if len == 0 {
+        1
+    } else {
+        len.div_ceil(num_threads)
+    };
     let mut tasks_done = Vec::new();
-    
+
     if is_float {
         let float_array = arrow_array.as_any().downcast_ref::<Float64Array>().unwrap();
         let input_slice = float_array.values();
         let mut results = vec![0f64; len];
-        
+
         let chunks = input_slice.chunks(chunk_size);
         let mut_out_chunks = results.chunks_mut(chunk_size);
-        
+
         for (chunk, mut_out_chunk) in chunks.zip(mut_out_chunks) {
             let done = Arc::new((Mutex::new(None), Condvar::new()));
             tasks_done.push(done.clone());
-            
+
             let task = Task {
                 module_name: module_name.to_string(),
                 func_name: func_name.to_string(),
@@ -242,13 +274,14 @@ fn execute<'py>(
                 len: chunk.len(),
                 done,
             };
-            
+
             // Work stealing: push to MPSC channel wrapped in a Mutex
             let tx = &pool.0;
-            tx.send(WorkerMessage::Task(task)).map_err(|_| PyRuntimeError::new_err("Worker thread panicked or died"))?;
+            tx.send(WorkerMessage::Task(task))
+                .map_err(|_| PyRuntimeError::new_err("Worker thread panicked or died"))?;
         }
-        
-        let wait_result = py.detach(|| {
+
+        let wait_result = py.detach(|| -> TaskResult {
             for done in tasks_done {
                 let (lock, cvar) = &*done;
                 let mut result_guard = lock.lock().unwrap();
@@ -256,37 +289,39 @@ fn execute<'py>(
                     result_guard = cvar.wait(result_guard).unwrap();
                 }
                 let res = result_guard.take().unwrap();
-                if let Err(msg) = res {
-                    return Err(msg);
-                }
+                res?;
             }
             Ok(())
         });
-        
+
         match wait_result {
             Ok(_) => {
                 let result_array = Float64Array::from(results);
                 let result_data = result_array.into_data();
                 result_data.to_pyarrow(py)
-            },
+            }
             Err(msg) => Err(PyRuntimeError::new_err(msg)),
         }
     } else {
         let int_array = match arrow_array.as_any().downcast_ref::<Int64Array>() {
             Some(arr) => arr,
-            None => return Err(PyRuntimeError::new_err("hyperfunctions currently only supports arrays of int64 or float64.")),
+            None => {
+                return Err(PyRuntimeError::new_err(
+                    "hyperfunctions currently only supports arrays of int64 or float64.",
+                ));
+            }
         };
-        
+
         let input_slice = int_array.values();
         let mut results = vec![0i64; len];
-        
+
         let chunks = input_slice.chunks(chunk_size);
         let mut_out_chunks = results.chunks_mut(chunk_size);
-        
+
         for (chunk, mut_out_chunk) in chunks.zip(mut_out_chunks) {
             let done = Arc::new((Mutex::new(None), Condvar::new()));
             tasks_done.push(done.clone());
-            
+
             let task = Task {
                 module_name: module_name.to_string(),
                 func_name: func_name.to_string(),
@@ -298,13 +333,14 @@ fn execute<'py>(
                 len: chunk.len(),
                 done,
             };
-            
+
             // Work stealing: push to MPSC channel wrapped in a Mutex
             let tx = &pool.0;
-            tx.send(WorkerMessage::Task(task)).map_err(|_| PyRuntimeError::new_err("Worker thread panicked or died"))?;
+            tx.send(WorkerMessage::Task(task))
+                .map_err(|_| PyRuntimeError::new_err("Worker thread panicked or died"))?;
         }
-        
-        let wait_result = py.detach(|| {
+
+        let wait_result = py.detach(|| -> TaskResult {
             for done in tasks_done {
                 let (lock, cvar) = &*done;
                 let mut result_guard = lock.lock().unwrap();
@@ -312,19 +348,17 @@ fn execute<'py>(
                     result_guard = cvar.wait(result_guard).unwrap();
                 }
                 let res = result_guard.take().unwrap();
-                if let Err(msg) = res {
-                    return Err(msg);
-                }
+                res?;
             }
             Ok(())
         });
-        
+
         match wait_result {
             Ok(_) => {
                 let result_array = Int64Array::from(results);
                 let result_data = result_array.into_data();
                 result_data.to_pyarrow(py)
-            },
+            }
             Err(msg) => Err(PyRuntimeError::new_err(msg)),
         }
     }
@@ -332,20 +366,20 @@ fn execute<'py>(
 
 #[pyfunction]
 fn shutdown_workers(py: Python) {
-    let _ = py.detach(|| {
+    py.detach(|| {
         if let Some((tx, pool)) = WORKER_POOL.get() {
             let num_threads = pool.len();
             // Send exactly one shutdown message per worker thread
             for _ in 0..num_threads {
                 let _ = tx.send(WorkerMessage::Shutdown);
             }
-            
+
             // Then join them all to ensure Py_EndInterpreter is done safely
             for mutex_handle in pool {
-                if let Ok(mut handle_opt) = mutex_handle.lock() {
-                    if let Some(handle) = handle_opt.take() {
-                        let _ = handle.join();
-                    }
+                if let Ok(mut handle_opt) = mutex_handle.lock()
+                    && let Some(handle) = handle_opt.take()
+                {
+                    let _ = handle.join();
                 }
             }
         }
@@ -354,8 +388,6 @@ fn shutdown_workers(py: Python) {
 
 #[pymodule]
 mod _hyperfunctions {
-    use super::*;
-
     #[pymodule_export]
     use super::execute;
 
