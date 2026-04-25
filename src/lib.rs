@@ -26,21 +26,25 @@ fn execute<'py>(
     let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let chunk_size = if len == 0 { 1 } else { (len + num_threads - 1) / num_threads };
     
-    let input_slice = int_array.values().to_vec();
+    let input_slice = int_array.values();
     let module_name = module_name.to_string();
     let func_name = func_name.to_string();
     
     let thread_result = py.detach(|| {
-        std::thread::scope(|s| -> Result<Vec<i64>, String> {
+        let mut results = vec![0i64; len];
+        
+        let exec_result = std::thread::scope(|s| -> Result<(), String> {
             let mut handles = vec![];
             
-            for chunk in input_slice.chunks(chunk_size) {
+            let chunks = input_slice.chunks(chunk_size);
+            let mut_out_chunks = results.chunks_mut(chunk_size);
+            
+            for (chunk, mut_out_chunk) in chunks.zip(mut_out_chunks) {
                 let mod_name = module_name.clone();
                 let fn_name = func_name.clone();
-                let chunk_vec = chunk.to_vec();
                 let paths = sys_path.clone();
                 
-                handles.push(s.spawn(move || -> Result<Vec<i64>, String> {
+                handles.push(s.spawn(move || -> Result<(), String> {
                     unsafe {
                         let config = PyInterpreterConfig {
                             use_main_obmalloc: 0,
@@ -57,8 +61,6 @@ fn execute<'py>(
                             return Err("Failed to create sub-interpreter".to_string());
                         }
                         
-                        let mut chunk_results = vec![0i64; chunk_vec.len()];
-                        
                         let thread_exec_result: Result<(), String> = Python::attach(|py_sub| {
                             let execute_inner = || -> PyResult<()> {
                                 let sys = py_sub.import("sys")?;
@@ -70,10 +72,10 @@ fn execute<'py>(
                                 let module = py_sub.import(&mod_name)?;
                                 let func = module.getattr(&fn_name)?;
                                 
-                                for (j, &val) in chunk_vec.iter().enumerate() {
+                                for (j, &val) in chunk.iter().enumerate() {
                                     let res = func.call1((val,))?;
                                     let res_i64: i64 = res.extract()?;
-                                    chunk_results[j] = res_i64;
+                                    mut_out_chunk[j] = res_i64;
                                 }
                                 Ok(())
                             };
@@ -86,26 +88,22 @@ fn execute<'py>(
                         
                         Py_EndInterpreter(tstate);
                         
-                        match thread_exec_result {
-                            Ok(_) => Ok(chunk_results),
-                            Err(msg) => Err(msg),
-                        }
+                        thread_exec_result
                     }
                 }));
             }
             
-            let mut results = vec![0i64; len];
-            let mut offset = 0;
             for handle in handles {
-                let chunk_res = handle.join().map_err(|_| "Rust thread panicked".to_string())??;
-                for val in chunk_res {
-                    results[offset] = val;
-                    offset += 1;
-                }
+                handle.join().map_err(|_| "Rust thread panicked".to_string())??;
             }
             
-            Ok(results)
-        })
+            Ok(())
+        });
+        
+        match exec_result {
+            Ok(_) => Ok(results),
+            Err(e) => Err(e),
+        }
     });
     
     match thread_result {
