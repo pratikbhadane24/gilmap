@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.13,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "hyperfunctions"
+requires-python = ">=3.12"
+dependencies = [
+    "pyarrow>=14.0.0",
+]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+dynamic = ["version"]
