@@ -5,13 +5,16 @@ Rust worker threads and Python sub-interpreters.
 """
 
 from collections.abc import Callable, Iterable
+import atexit
 import sys
 
 import pyarrow as pa
 
-from _hyperfunctions import execute
+from _hyperfunctions import execute, shutdown_workers
 
-def map(func: Callable[[int], int], iterable: Iterable[int] | pa.Array) -> list[int]:
+atexit.register(shutdown_workers)
+
+def map(func: Callable[[int], int], iterable: Iterable[int] | pa.Array) -> list[int] | pa.Array:
     """Execute a module-level Python callable over integer data in parallel.
 
     The function must be importable by module/name from worker sub-interpreters.
@@ -23,7 +26,7 @@ def map(func: Callable[[int], int], iterable: Iterable[int] | pa.Array) -> list[
         iterable: Iterable of integers or a PyArrow array castable to ``int64``.
 
     Returns:
-        A ``list[int]`` with one result per input, preserving input order.
+        A ``list[int]`` if an iterable was passed, or a ``pyarrow.Array`` if a PyArrow array was passed, preserving input order.
 
     Raises:
         TypeError: If ``func`` is not callable or input is not integer-castable.
@@ -48,8 +51,10 @@ def map(func: Callable[[int], int], iterable: Iterable[int] | pa.Array) -> list[
         )
 
     # Convert the iterable to a PyArrow array for zero-copy(ish) passage to Rust
+    return_list = False
     if not isinstance(iterable, pa.Array):
         iterable = pa.array(iterable)
+        return_list = True
         
     if not pa.types.is_int64(iterable.type):
         try:
@@ -63,7 +68,10 @@ def map(func: Callable[[int], int], iterable: Iterable[int] | pa.Array) -> list[
     # It returns a PyArrow array of the results
     result_array = execute(module_name, func_name, iterable, sys.path)
     
-    # We convert back to list for dead-simple "plain python" compatibility
+    # We convert back to list for dead-simple "plain python" compatibility if a list was passed
     if result_array is not None:
-        return result_array.to_pylist()
-    return []
+        if return_list:
+            return result_array.to_pylist()
+        return result_array
+        
+    return [] if return_list else pa.array([], type=pa.int64())

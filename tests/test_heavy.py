@@ -73,4 +73,11 @@ if __name__ == "__main__":
     # run hyperfunctions
     s = time.time()
     _ = hyperfunctions.map(quick_collatz, overhead_args)
-    print(f"Hyperfunctions (overhead): {time.time() - s:.4f}s")
+    print(f"Hyperfunctions (overhead, list): {time.time() - s:.4f}s")
+
+    # run hyperfunctions with arrow
+    import pyarrow as pa
+    arrow_args = pa.array(overhead_args)
+    s = time.time()
+    _ = hyperfunctions.map(quick_collatz, arrow_args)
+    print(f"Hyperfunctions (overhead, arrow): {time.time() - s:.4f}s")
