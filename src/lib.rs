@@ -315,7 +315,7 @@ fn execute<'py>(
             Some(arr) => arr,
             None => {
                 return Err(PyRuntimeError::new_err(
-                    "hyperfunctions currently only supports arrays of int64 or float64.",
+                    "gilmap currently only supports arrays of int64 or float64.",
                 ));
             }
         };
@@ -384,7 +384,7 @@ fn shutdown_workers(py: Python) {
 }
 
 #[pymodule]
-mod _hyperfunctions {
+mod _gilmap {
     #[pymodule_export]
     use super::execute;
 

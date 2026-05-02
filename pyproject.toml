@@ -3,7 +3,7 @@ requires = ["maturin>=1.13,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "hyperfunctions"
+name = "gilmap"
 requires-python = ">=3.12"
 dependencies = [
     "pyarrow>=14.0.0",

@@ -1,5 +1,5 @@
 import time
-import hyperfunctions
+import gilmap
 import sys
 import os
 
@@ -8,15 +8,15 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from tasks import slow_square
 
-def test_hyperfunctions():
+def test_gilmap():
     args = list(range(10))
     
     start = time.time()
-    result = hyperfunctions.map(slow_square, args)
+    result = gilmap.map(slow_square, args)
     end = time.time()
     
-    print(f"Hyperfunctions result: {result}")
-    print(f"Hyperfunctions time: {end - start:.2f}s")
+    print(f"gilmap result: {result}")
+    print(f"gilmap time: {end - start:.2f}s")
     
     # Compare with standard map
     start2 = time.time()
@@ -27,10 +27,10 @@ def test_hyperfunctions():
     print(f"Standard map time: {end2 - start2:.2f}s")
     
     assert result == expected
-    # In a truly parallel scenario, hyperfunctions time should be less than standard map time
+    # In a truly parallel scenario, gilmap time should be less than standard map time
     # on a multi-core machine.
     assert end - start < end2 - start2, "Parallelism not achieved!"
     print("Parallelism achieved!")
 
 if __name__ == "__main__":
-    test_hyperfunctions()
+    test_gilmap()

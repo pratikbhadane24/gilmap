@@ -1,6 +1,6 @@
-# hyperfunctions
+# gilmap
 
-`hyperfunctions` is a Python + Rust parallel map runtime for numeric, single-argument, module-level Python functions.
+`gilmap` is a Python + Rust parallel map runtime for numeric, single-argument, module-level Python functions.
 
 It combines:
 
@@ -8,11 +8,11 @@ It combines:
 - Python sub-interpreters (one per worker thread)
 - Apache Arrow arrays for efficient Python <-> Rust transfer
 
-The public API is one function: `hyperfunctions.map`.
+The public API is one function: `gilmap.map`.
 
 ## What it is optimized for
 
-`hyperfunctions.map` is best for **CPU-bound** functions where each element does enough work to amortize scheduling/conversion overhead.
+`gilmap.map` is best for **CPU-bound** functions where each element does enough work to amortize scheduling/conversion overhead.
 
 It is usually a poor fit for:
 
@@ -36,7 +36,7 @@ pip install -U pip maturin pyarrow pytest
 maturin develop
 ```
 
-`maturin develop` builds and installs the `_hyperfunctions` extension for the active environment.
+`maturin develop` builds and installs the `_gilmap` extension for the active environment.
 
 ## Quick start
 
@@ -50,10 +50,10 @@ def square(x: int) -> int:
 
 ```python
 # app.py
-import hyperfunctions
+import gilmap
 from tasks import square
 
-out = hyperfunctions.map(square, [1, 2, 3, 4])
+out = gilmap.map(square, [1, 2, 3, 4])
 print(out)  # [1, 4, 9, 16]
 ```
 
@@ -63,24 +63,24 @@ print(out)  # [1, 4, 9, 16]
 def affine(x: float) -> float:
     return x * 1.5 + 0.5
 
-print(hyperfunctions.map(affine, [1.0, 2.0, 3.0]))
+print(gilmap.map(affine, [1.0, 2.0, 3.0]))
 ```
 
 ### Arrow input (Arrow output)
 
 ```python
 import pyarrow as pa
-import hyperfunctions
+import gilmap
 from tasks import square
 
 arr = pa.array([1, 2, 3, 4], type=pa.int64())
-out = hyperfunctions.map(square, arr)
+out = gilmap.map(square, arr)
 print(type(out))  # pyarrow.Array
 ```
 
 ## API reference
 
-### `hyperfunctions.map(func, iterable) -> list | pyarrow.Array`
+### `gilmap.map(func, iterable) -> list | pyarrow.Array`
 
 Executes `func` over `iterable` in parallel while preserving element order.
 
@@ -127,7 +127,7 @@ If any worker fails, the whole call fails and no partial result is returned.
 
 ## Architecture
 
-### Python layer (`hyperfunctions/__init__.py`)
+### Python layer (`gilmap/__init__.py`)
 
 1. Validates callable constraints
 2. Converts/casts input to Arrow (`int64` or `float64`)
@@ -150,7 +150,7 @@ If any worker fails, the whole call fails and no partial result is returned.
 ## Worker lifecycle and shutdown
 
 - Worker threads/sub-interpreters are long-lived after first use
-- They are reused across `hyperfunctions.map` calls
+- They are reused across `gilmap.map` calls
 - `shutdown_workers` sends one shutdown message per worker and joins threads
 - `shutdown_workers` is automatically called at process exit via `atexit`
 
@@ -189,8 +189,8 @@ The script prints timings for:
 
 - standard `map`
 - `multiprocessing.Pool.map`
-- `hyperfunctions.map` with list input
-- `hyperfunctions.map` with Arrow input (for overhead/float cases)
+- `gilmap.map` with list input
+- `gilmap.map` with Arrow input (for overhead/float cases)
 
 ### Interpreting results
 
@@ -213,7 +213,7 @@ The script prints timings for:
 ├── Cargo.toml
 ├── pyproject.toml
 ├── src/lib.rs
-├── hyperfunctions/__init__.py
+├── gilmap/__init__.py
 └── tests/
     ├── tasks.py
     ├── test_parallel.py

@@ -1,6 +1,6 @@
 import time
 import multiprocessing
-import hyperfunctions
+import gilmap
 import sys
 import os
 
@@ -28,13 +28,13 @@ def run_benchmark(name, func, args):
     
     assert res_mp == expected, "Multiprocessing returned wrong results"
     
-    # 3. hyperfunctions.map
+    # 3. gilmap.map
     start_hf = time.time()
-    res_hf = hyperfunctions.map(func, args)
+    res_hf = gilmap.map(func, args)
     end_hf = time.time()
-    print(f"Hyperfunctions map: {end_hf - start_hf:.4f}s")
+    print(f"gilmap map: {end_hf - start_hf:.4f}s")
     
-    assert res_hf == expected, "Hyperfunctions returned wrong results"
+    assert res_hf == expected, "gilmap returned wrong results"
     
     print(f"Speedup vs Standard map: {(end_std - start_std) / (end_hf - start_hf):.2f}x")
     print(f"Speedup vs Multiprocessing: {(end_mp - start_mp) / (end_hf - start_hf):.2f}x\n")
@@ -70,17 +70,17 @@ if __name__ == "__main__":
         _ = p.map(quick_collatz, overhead_args)
     print(f"Multiprocessing (overhead): {time.time() - s:.4f}s")
     
-    # run hyperfunctions
+    # run gilmap
     s = time.time()
-    _ = hyperfunctions.map(quick_collatz, overhead_args)
-    print(f"Hyperfunctions (overhead, list): {time.time() - s:.4f}s")
+    _ = gilmap.map(quick_collatz, overhead_args)
+    print(f"gilmap (overhead, list): {time.time() - s:.4f}s")
 
-    # run hyperfunctions with arrow
+    # run gilmap with arrow
     import pyarrow as pa
     arrow_args = pa.array(overhead_args)
     s = time.time()
-    _ = hyperfunctions.map(quick_collatz, arrow_args)
-    print(f"Hyperfunctions (overhead, arrow): {time.time() - s:.4f}s")
+    _ = gilmap.map(quick_collatz, arrow_args)
+    print(f"gilmap (overhead, arrow): {time.time() - s:.4f}s")
     
     # Test 4: Float Computation
     print("--- Float Computation ---")
@@ -91,10 +91,10 @@ if __name__ == "__main__":
     print(f"Standard map (float): {time.time() - s:.4f}s")
 
     s = time.time()
-    _ = hyperfunctions.map(float_math, float_args)
-    print(f"Hyperfunctions (float, list): {time.time() - s:.4f}s")
+    _ = gilmap.map(float_math, float_args)
+    print(f"gilmap (float, list): {time.time() - s:.4f}s")
 
     arrow_float_args = pa.array(float_args)
     s = time.time()
-    _ = hyperfunctions.map(float_math, arrow_float_args)
-    print(f"Hyperfunctions (float, arrow): {time.time() - s:.4f}s")
+    _ = gilmap.map(float_math, arrow_float_args)
+    print(f"gilmap (float, arrow): {time.time() - s:.4f}s")

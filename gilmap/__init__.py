@@ -1,6 +1,6 @@
-"""Public Python API for hyperfunctions.
+"""Public Python API for gilmap.
 
-This module exposes ``hyperfunctions.map``, a parallel map-style helper backed by
+This module exposes ``gilmap.map``, a parallel map-style helper backed by
 Rust worker threads and Python sub-interpreters.
 """
 
@@ -10,7 +10,7 @@ import sys
 
 import pyarrow as pa
 
-from _hyperfunctions import execute, shutdown_workers
+from _gilmap import execute, shutdown_workers
 
 atexit.register(shutdown_workers)
 
@@ -38,15 +38,15 @@ def map(func: Callable, iterable: Iterable | pa.Array) -> list | pa.Array:
         
     func_name = getattr(func, "__name__", "")
     if func_name == "<lambda>":
-        raise ValueError("hyperfunctions.map does not support lambda functions. Please pass a module-level function.")
+        raise ValueError("gilmap.map does not support lambda functions. Please pass a module-level function.")
     
     if "<locals>" in getattr(func, "__qualname__", ""):
-        raise ValueError("hyperfunctions.map does not support local functions. Please pass a module-level function.")
+        raise ValueError("gilmap.map does not support local functions. Please pass a module-level function.")
 
     module_name = getattr(func, "__module__", "")
     if module_name == "__main__":
         raise ValueError(
-            "hyperfunctions.map cannot execute functions defined in the __main__ script directly. "
+            "gilmap.map cannot execute functions defined in the __main__ script directly. "
             "Please define your function in a separate module and import it."
         )
 
@@ -60,13 +60,13 @@ def map(func: Callable, iterable: Iterable | pa.Array) -> list | pa.Array:
         try:
             iterable = iterable.cast(pa.float64())
         except pa.ArrowInvalid:
-            raise TypeError("hyperfunctions.map cannot cast input to float64.")
+            raise TypeError("gilmap.map cannot cast input to float64.")
     else:
         try:
             # Attempt to cast to int64 if it's not already
             iterable = iterable.cast(pa.int64())
         except pa.ArrowInvalid:
-            raise TypeError("hyperfunctions.map currently only supports arrays of integers or floats.")
+            raise TypeError("gilmap.map currently only supports arrays of integers or floats.")
 
     # Call the Rust execution engine
     # execute() will spawn sub-interpreters and run the function
