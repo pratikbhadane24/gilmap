@@ -140,7 +140,7 @@ If any worker fails, the whole call fails and no partial result is returned.
 1. Lazily initializes a global worker pool (`OnceLock`) on first call
 2. Starts one thread per `available_parallelism()`
 3. Creates one Python sub-interpreter per worker thread
-4. Receives chunked tasks over MPSC channel
+4. Receives chunked tasks over a shared queue
 5. Caches imported function objects per worker (`(module_name, func_name)` key)
 6. Extends worker `sys.path` from caller-provided entries
 7. Executes function for each value in the chunk

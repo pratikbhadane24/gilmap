@@ -1,10 +1,10 @@
 use arrow::array::{Array, Float64Array, Int64Array, make_array};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
+use crossbeam_channel::{Sender, unbounded};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::ffi::*;
 use pyo3::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 type TaskResult = Result<(), String>;
@@ -44,12 +44,34 @@ enum WorkerMessage {
 
 static WORKER_POOL: OnceLock<WorkerPool> = OnceLock::new();
 
+fn wait_for_tasks(tasks_done: Vec<TaskDone>) -> TaskResult {
+    let mut first_error: Option<String> = None;
+
+    for done in tasks_done {
+        let (lock, cvar) = &*done;
+        let mut result_guard = lock.lock().unwrap();
+        while result_guard.is_none() {
+            result_guard = cvar.wait(result_guard).unwrap();
+        }
+
+        if let Err(err) = result_guard.take().unwrap()
+            && first_error.is_none()
+        {
+            first_error = Some(err);
+        }
+    }
+
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
 fn init_worker_pool() -> WorkerPool {
     let num_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let (tx, rx) = channel::<WorkerMessage>();
-    let rx = Arc::new(Mutex::new(rx));
+    let (tx, rx) = unbounded::<WorkerMessage>();
     let mut pool = Vec::new();
 
     for _ in 0..num_threads {
@@ -76,10 +98,7 @@ fn init_worker_pool() -> WorkerPool {
                 let mut path_set: HashSet<String> = HashSet::new();
 
                 loop {
-                    let msg = {
-                        let lock = rx_clone.lock().unwrap();
-                        lock.recv()
-                    };
+                    let msg = rx_clone.recv();
                     match msg {
                         Ok(WorkerMessage::Shutdown) | Err(_) => {
                             func_cache.clear(); // Drop any cached PyObjects before Py_EndInterpreter
@@ -275,24 +294,13 @@ fn execute<'py>(
                 done,
             };
 
-            // Work stealing: push to MPSC channel wrapped in a Mutex
+            // Push work to the shared queue
             let tx = &pool.0;
             tx.send(WorkerMessage::Task(task))
                 .map_err(|_| PyRuntimeError::new_err("Worker thread panicked or died"))?;
         }
 
-        let wait_result = py.detach(|| -> TaskResult {
-            for done in tasks_done {
-                let (lock, cvar) = &*done;
-                let mut result_guard = lock.lock().unwrap();
-                while result_guard.is_none() {
-                    result_guard = cvar.wait(result_guard).unwrap();
-                }
-                let res = result_guard.take().unwrap();
-                res?;
-            }
-            Ok(())
-        });
+        let wait_result = py.detach(|| wait_for_tasks(tasks_done));
 
         match wait_result {
             Ok(_) => {
@@ -334,24 +342,13 @@ fn execute<'py>(
                 done,
             };
 
-            // Work stealing: push to MPSC channel wrapped in a Mutex
+            // Push work to the shared queue
             let tx = &pool.0;
             tx.send(WorkerMessage::Task(task))
                 .map_err(|_| PyRuntimeError::new_err("Worker thread panicked or died"))?;
         }
 
-        let wait_result = py.detach(|| -> TaskResult {
-            for done in tasks_done {
-                let (lock, cvar) = &*done;
-                let mut result_guard = lock.lock().unwrap();
-                while result_guard.is_none() {
-                    result_guard = cvar.wait(result_guard).unwrap();
-                }
-                let res = result_guard.take().unwrap();
-                res?;
-            }
-            Ok(())
-        });
+        let wait_result = py.detach(|| wait_for_tasks(tasks_done));
 
         match wait_result {
             Ok(_) => {
