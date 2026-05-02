@@ -164,37 +164,60 @@ python -m pytest -q
 
 ## Benchmarking
 
-Benchmark harnesses are included in `tests/test_heavy.py` and `tests/test_parallel.py`.
+Numbers below are regenerated from a real harness run — see `docs/BENCHMARKS.md`
+for the full report (per-workload tables, charts, and a mandatory "where gilmap
+loses" section). The block between the markers is overwritten by
+`python -m benchmarks.report <results.json>`; do not hand-edit it.
 
-### Benchmark workloads in repo
+<!-- BENCH:START -->
+On `float_math` at N=1,000,000, **gilmap** (gilmap_arrow@arrow) is **5.22× faster** than the best non-gilmap runner (`numba`) — measured on Apple M3 Max.
 
-| Workload | Function(s) | Goal |
-| --- | --- | --- |
-| Prime counting | `count_primes` | CPU-heavy integer compute |
-| Heavy collatz | `heavy_collatz` | Long iterative integer compute |
-| Overhead stress | `quick_collatz` over ~1M values | Measures framework overhead on light compute |
-| Float pipeline | `float_math` over ~1M values | Float path behavior + Arrow/list input comparison |
+**Summary across 6 workloads:**
 
-### Run benchmark suite
+| workload | best gilmap variant | speedup vs runner-up | runner-up |
+|---|---|---|---|
+| float_math N=1,000,000 | gilmap_arrow@arrow | 5.22× | numba |
+| quick_collatz N=100,000 | gilmap_arrow@arrow | 4.40× | numba |
+| float_math N=100,000 | gilmap_arrow@arrow | 4.17× | numba |
+| quick_collatz N=1,000,000 | gilmap_arrow@arrow | 3.83× | numba |
+| float_math N=10,000 | gilmap_arrow@arrow | 2.29× | numpy_vec |
+| ⚠ mandelbrot_iters N=10,000 | gilmap_arrow@arrow | 0.04× (we lose) | numba |
+| ⚠ mandelbrot_iters N=25,000 | gilmap_arrow@arrow | 0.04× (we lose) | numba |
+| ⚠ mandelbrot_iters N=1,000 | gilmap_arrow@arrow | 0.06× (we lose) | numba |
+
+⚠ rows are workloads where gilmap loses to a faster runner — included so this table is honest, not cherry-picked. Full breakdown in `docs/BENCHMARKS.md`.
+
+<!-- BENCH:END -->
+
+### What the suite measures
+
+`benchmarks/` runs a sweep across input size, lane (int64/float64), and container
+(list/Arrow) and compares `gilmap.map` against:
+
+- `map` (single-thread baseline)
+- `multiprocessing.Pool` and `concurrent.futures.ProcessPoolExecutor`
+- `concurrent.futures.ThreadPoolExecutor` (GIL-bound; included to show why
+  naive threading fails for CPU work)
+- `joblib.Parallel` (loky), `ray`, `dask` — when installed
+- `numpy` vector form and `numba @njit(parallel=True)` for vectorizable
+  workloads — included so the report can honestly show where gilmap loses
+
+Each cell is warmed up once and timed N=3 times by default (`--repeats`
+flag to override); results are byte-equivalent to the `map` baseline
+(1e-6 float tolerance) or the cell fails. First-call warmup cost and
+per-runner setup cost are reported separately, not amortized into
+steady-state numbers.
+
+### Reproduce
 
 ```bash
-source .venv/bin/activate
-python tests/test_heavy.py
+pip install -e ".[bench]"
+python -m benchmarks.run --out benchmarks/results/$(hostname)-$(date +%Y%m%d).json
+python -m benchmarks.report benchmarks/results/<file>.json
 ```
 
-The script prints timings for:
-
-- standard `map`
-- `multiprocessing.Pool.map`
-- `gilmap.map` with list input
-- `gilmap.map` with Arrow input (for overhead/float cases)
-
-### Interpreting results
-
-- Expect strongest wins on CPU-heavy tasks with enough per-element work.
-- For tiny operations, plain `map` can be faster due to lower overhead.
-- Arrow input often reduces conversion overhead versus list input for large arrays.
-- Compare against `multiprocessing` on your target machine; winner depends on workload shape and IPC cost.
+The report generator refuses to publish if no losses are recorded — the
+"Where gilmap loses" section is mandatory so the marketing stays honest.
 
 ## Known limitations
 
@@ -211,11 +234,20 @@ The script prints timings for:
 ├── pyproject.toml
 ├── src/lib.rs
 ├── gilmap/__init__.py
-└── tests/
-    ├── tasks.py
-    ├── test_parallel.py
-    ├── test_safety.py
-    └── test_heavy.py
+├── tests/
+│   ├── tasks.py
+│   ├── test_parallel.py
+│   ├── test_safety.py
+│   └── test_heavy.py
+├── benchmarks/             # dev-only benchmark suite
+│   ├── workloads.py
+│   ├── runners.py
+│   ├── harness.py
+│   ├── suite.py
+│   ├── run.py
+│   └── report.py
+└── docs/
+    └── BENCHMARKS.md       # generated; full benchmark report
 ```
 
 ## CI and packaging

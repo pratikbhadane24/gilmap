@@ -31,7 +31,35 @@ classifiers = [
 ]
 dynamic = ["version"]
 
+[project.optional-dependencies]
+# Dev-only benchmark suite. Install with: pip install -e ".[bench]"
+# Optional comparator deps (joblib, numba, ray, dask) are skipped cleanly
+# by the harness if any one fails to install on a given platform.
+bench = [
+    "matplotlib>=3.8",
+    "numpy>=1.26",
+    "joblib>=1.3",
+    "numba>=0.59",
+    "ray>=2.9",
+    "dask[delayed]>=2024.1",
+    "psutil>=5.9",
+]
+
 [project.urls]
 Homepage = "https://github.com/pratikbhadane/gilmap"
 Repository = "https://github.com/pratikbhadane/gilmap"
 Issues = "https://github.com/pratikbhadane/gilmap/issues"
+
+[tool.maturin]
+# Mixed Python/Rust project: gilmap/ sits at the repo root.
+python-source = "."
+python-packages = ["gilmap"]
+# Keep dev-only directories out of the published wheel.
+# Use sdist-include / exclude rather than wholesale path patterns so
+# the gilmap/ Python package still ships.
+exclude = [
+    { path = "benchmarks/**/*", format = ["wheel", "sdist"] },
+    { path = "phases/**/*", format = ["wheel", "sdist"] },
+    { path = "tests/**/*", format = ["wheel", "sdist"] },
+    { path = "docs/**/*", format = ["wheel", "sdist"] },
+]

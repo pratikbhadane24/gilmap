@@ -74,3 +74,7 @@ docs/_build/
 
 # Misc
 **/phases
+
+# Benchmark scratch outputs (committed canonical results live in benchmarks/results/)
+benchmarks/results/scratch_*.json
+benchmarks/results/smoke*.json
