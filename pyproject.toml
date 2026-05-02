@@ -4,12 +4,34 @@ build-backend = "maturin"
 
 [project]
 name = "gilmap"
+description = "Parallel map for CPU-bound numeric Python via Rust workers and per-worker Python sub-interpreters"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Pratik Bhadane" }]
 requires-python = ">=3.12"
 dependencies = [
     "pyarrow>=14.0.0",
 ]
 classifiers = [
-    "Programming Language :: Rust",
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Distributed Computing",
 ]
 dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/pratikbhadane/gilmap"
+Repository = "https://github.com/pratikbhadane/gilmap"
+Issues = "https://github.com/pratikbhadane/gilmap/issues"

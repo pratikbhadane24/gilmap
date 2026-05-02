@@ -20,23 +20,20 @@ It is usually a poor fit for:
 - I/O-bound callables
 - lambdas/local functions/not-importable functions
 
-## Requirements
-
-- Python `>= 3.12`
-- Rust toolchain (`cargo`, `rustc`)
-- `maturin`
-- `pyarrow`
-
-## Install (local development)
+## Install
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -U pip maturin pyarrow pytest
-maturin develop
+pip install gilmap
 ```
 
-`maturin develop` builds and installs the `_gilmap` extension for the active environment.
+Prebuilt wheels are published for CPython 3.12 and 3.13 on Linux (x86_64, aarch64), macOS (x86_64, arm64), and Windows (x64). No Rust toolchain required.
+
+> **Note:** gilmap requires a standard GIL-enabled CPython build. Free-threaded builds (`cp313t`) are not supported because per-worker sub-interpreters with their own GIL are incompatible with PEP 703.
+
+## Requirements
+
+- CPython `>= 3.12` (GIL-enabled build)
+- `pyarrow >= 14.0.0` (installed automatically)
 
 ## Quick start
 
@@ -224,3 +221,21 @@ The script prints timings for:
 ## CI and packaging
 
 The GitHub Actions workflow builds wheels/sdists for multiple platforms using maturin.
+
+## Build from source
+
+Only needed for development on gilmap itself, or to install on a platform without a prebuilt wheel.
+
+Prerequisites:
+
+- Rust toolchain (`cargo`, `rustc`)
+- `maturin`
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -U pip maturin pytest
+maturin develop
+```
+
+`maturin develop` builds and installs the `_gilmap` extension for the active environment.

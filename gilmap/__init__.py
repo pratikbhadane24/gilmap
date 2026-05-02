@@ -7,10 +7,21 @@ Rust worker threads and Python sub-interpreters.
 from collections.abc import Callable, Iterable
 import atexit
 import sys
+import sysconfig
 
 import pyarrow as pa
 
 from _gilmap import execute, shutdown_workers
+
+# gilmap relies on Py_NewInterpreterFromConfig with gil = OWN_GIL (PEP 684).
+# Free-threaded CPython builds (PEP 703) share a single interpreter and the
+# combination is not currently defined; refuse to load there with a clear error.
+if sysconfig.get_config_var("Py_GIL_DISABLED"):
+    raise RuntimeError(
+        "gilmap does not support free-threaded CPython builds (cp313t and similar). "
+        "Per-worker sub-interpreters with their own GIL are incompatible with PEP 703. "
+        "Run gilmap on a standard GIL-enabled CPython 3.12 or 3.13 build."
+    )
 
 atexit.register(shutdown_workers)
 
