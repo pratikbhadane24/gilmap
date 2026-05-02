@@ -1,6 +1,6 @@
 use arrow::array::{Array, Float64Array, Int64Array, make_array};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
-use crossbeam_channel::{Sender, unbounded};
+use crossbeam_channel::{Sender, bounded};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::ffi::*;
 use pyo3::prelude::*;
@@ -11,6 +11,20 @@ type TaskResult = Result<(), String>;
 type TaskDone = Arc<(Mutex<Option<TaskResult>>, Condvar)>;
 type WorkerHandle = std::sync::Mutex<Option<std::thread::JoinHandle<()>>>;
 type WorkerPool = (Sender<WorkerMessage>, Vec<WorkerHandle>);
+
+// Per-call shared metadata (module name, func name, sys.path) lifted out of
+// `Task` so that each chunk only carries a single Arc clone instead of
+// re-allocating the strings/Vec on every dispatch. Hot path on small inputs
+// where many chunks share identical metadata.
+struct CallContext {
+    module_name: Arc<str>,
+    func_name: Arc<str>,
+    sys_path: Arc<Vec<String>>,
+    // Identity hash of sys_path; workers compare this against the previous
+    // call's hash to skip the per-task `sys.path` import + scan when callers
+    // haven't changed it.
+    sys_path_id: u64,
+}
 
 #[derive(Clone, Copy)]
 enum DataType {
@@ -25,11 +39,8 @@ enum DataType {
 }
 unsafe impl Send for DataType {}
 
-// Task sent to workers
 struct Task {
-    module_name: String,
-    func_name: String,
-    sys_path: Vec<String>,
+    ctx: Arc<CallContext>,
     data: DataType,
     len: usize,
     done: TaskDone,
@@ -43,6 +54,41 @@ enum WorkerMessage {
 }
 
 static WORKER_POOL: OnceLock<WorkerPool> = OnceLock::new();
+
+// Tier-2: aim for many chunks (so fast workers steal from busy workers via
+// the shared channel) without making chunks so small that per-chunk dispatch
+// overhead eats the gains.
+//
+// Formula: num_chunks = min(len, max(num_threads * 4, ceil(len / MAX_CHUNK))).
+// Then chunk_size = ceil(len / num_chunks).
+//
+// - For len < num_threads*4 (e.g. test_parallel.py's len=10), chunks = len
+//   so each worker still gets one element — preserves small-input parallelism.
+// - For mid-size, chunks = num_threads*4 — ample stealing surface.
+// - For huge len, chunks scale up so chunk_size stays under MAX_CHUNK.
+const CHUNKS_PER_WORKER: usize = 4;
+const MAX_CHUNK: usize = 4096;
+
+fn pick_chunk_size(len: usize, num_threads: usize) -> usize {
+    if len == 0 {
+        return 1;
+    }
+    let want = (num_threads * CHUNKS_PER_WORKER).max(len.div_ceil(MAX_CHUNK));
+    let num_chunks = len.min(want.max(1));
+    len.div_ceil(num_chunks)
+}
+
+// Cheap-and-stable identity hash for sys.path so workers can detect a
+// no-change call and skip the `import sys; sys.path` round-trip entirely.
+fn sys_path_id(paths: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    paths.len().hash(&mut h);
+    for p in paths {
+        p.hash(&mut h);
+    }
+    h.finish()
+}
 
 fn wait_for_tasks(tasks_done: Vec<TaskDone>) -> TaskResult {
     let mut first_error: Option<String> = None;
@@ -71,7 +117,11 @@ fn init_worker_pool() -> WorkerPool {
     let num_threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
-    let (tx, rx) = unbounded::<WorkerMessage>();
+    // Tier-2: bounded channel sized to ~2× per-worker chunk depth so we
+    // get back-pressure (no megabytes of queued tasks for huge N) while
+    // still allowing workers to pipeline ahead of the dispatcher.
+    let queue_cap = num_threads * CHUNKS_PER_WORKER * 2;
+    let (tx, rx) = bounded::<WorkerMessage>(queue_cap);
     let mut pool = Vec::new();
 
     for _ in 0..num_threads {
@@ -94,48 +144,74 @@ fn init_worker_pool() -> WorkerPool {
                     return;
                 }
 
-                let mut func_cache: HashMap<(String, String), Py<PyAny>> = HashMap::new();
+                // Tier-1: cache by Arc<str> identity. Same (module, func)
+                // strings interned at the dispatcher share Arc storage, so
+                // hash + Eq compare pointer-equal Arcs in O(1) without
+                // allocating String keys per lookup.
+                let mut func_cache: HashMap<(Arc<str>, Arc<str>), Py<PyAny>> = HashMap::new();
                 let mut path_set: HashSet<String> = HashSet::new();
+                // Tier-1: track most recent (ctx_ptr, func) so back-to-back
+                // chunks of the same call hit a single pointer compare instead
+                // of even a hash lookup.
+                let mut last_ctx_ptr: *const CallContext = std::ptr::null();
+                let mut last_func: Option<Py<PyAny>> = None;
+                // Tier-1: skip sys.path scan when caller hasn't changed it.
+                let mut last_sys_path_id: u64 = u64::MAX;
 
                 loop {
                     let msg = rx_clone.recv();
                     match msg {
                         Ok(WorkerMessage::Shutdown) | Err(_) => {
-                            func_cache.clear(); // Drop any cached PyObjects before Py_EndInterpreter
+                            func_cache.clear();
+                            // last_func dropped by going out of scope; explicit
+                            // None-assign would be dead code (clippy).
                             break;
                         }
                         Ok(WorkerMessage::Task(task)) => {
                             let thread_exec_result: Result<(), String> = Python::attach(|py_sub| {
+                                let ctx = task.ctx.clone();
                                 let mut execute_inner = || -> PyResult<()> {
-                                    let func_obj = if let Some(func) = func_cache
-                                        .get(&(task.module_name.clone(), task.func_name.clone()))
+                                    let ctx_ptr = Arc::as_ptr(&ctx);
+                                    let func_obj: Py<PyAny> = if ctx_ptr == last_ctx_ptr
+                                        && let Some(f) = &last_func
                                     {
-                                        func.clone_ref(py_sub)
+                                        f.clone_ref(py_sub)
+                                    } else if let Some(f) = func_cache
+                                        .get(&(ctx.module_name.clone(), ctx.func_name.clone()))
+                                    {
+                                        let cloned = f.clone_ref(py_sub);
+                                        last_ctx_ptr = ctx_ptr;
+                                        last_func = Some(cloned.clone_ref(py_sub));
+                                        cloned
                                     } else {
-                                        let sys = py_sub.import("sys")?;
-                                        let path = sys.getattr("path")?;
-
-                                        // Add missing sys.paths for the task efficiently (O(1) checks locally)
-                                        for p in &task.sys_path {
-                                            if !path_set.contains(p) {
-                                                let p_str = p.as_str();
-                                                let contains = path
-                                                    .call_method1("__contains__", (p_str,))?
-                                                    .extract::<bool>()?;
-                                                if !contains {
-                                                    path.call_method1("append", (p_str,))?;
+                                        // sys.path append only if call brought new entries
+                                        if ctx.sys_path_id != last_sys_path_id {
+                                            let sys = py_sub.import("sys")?;
+                                            let path = sys.getattr("path")?;
+                                            for p in ctx.sys_path.iter() {
+                                                if !path_set.contains(p) {
+                                                    let p_str = p.as_str();
+                                                    let contains = path
+                                                        .call_method1("__contains__", (p_str,))?
+                                                        .extract::<bool>()?;
+                                                    if !contains {
+                                                        path.call_method1("append", (p_str,))?;
+                                                    }
+                                                    path_set.insert(p.clone());
                                                 }
-                                                path_set.insert(p.clone());
                                             }
+                                            last_sys_path_id = ctx.sys_path_id;
                                         }
 
-                                        let module = py_sub.import(task.module_name.as_str())?;
-                                        let func = module.getattr(task.func_name.as_str())?;
+                                        let module = py_sub.import(ctx.module_name.as_ref())?;
+                                        let func = module.getattr(ctx.func_name.as_ref())?;
                                         let func_obj = func.unbind();
                                         func_cache.insert(
-                                            (task.module_name.clone(), task.func_name.clone()),
+                                            (ctx.module_name.clone(), ctx.func_name.clone()),
                                             func_obj.clone_ref(py_sub),
                                         );
+                                        last_ctx_ptr = ctx_ptr;
+                                        last_func = Some(func_obj.clone_ref(py_sub));
                                         func_obj
                                     };
 
@@ -244,6 +320,22 @@ fn init_worker_pool() -> WorkerPool {
     (tx, pool)
 }
 
+// Process-wide intern table for module+function names so repeated calls with
+// the same callable share Arc<str> storage (no per-call allocation, and the
+// worker pointer-equality fast path actually fires).
+static NAME_INTERN: OnceLock<Mutex<HashMap<String, Arc<str>>>> = OnceLock::new();
+
+fn intern(name: &str) -> Arc<str> {
+    let table = NAME_INTERN.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = table.lock().unwrap();
+    if let Some(s) = guard.get(name) {
+        return s.clone();
+    }
+    let arc: Arc<str> = Arc::from(name);
+    guard.insert(name.to_string(), arc.clone());
+    arc
+}
+
 #[pyfunction]
 fn execute<'py>(
     py: Python<'py>,
@@ -263,11 +355,16 @@ fn execute<'py>(
 
     let is_float = arrow_array.data_type() == &arrow::datatypes::DataType::Float64;
 
-    let chunk_size = if len == 0 {
-        1
-    } else {
-        len.div_ceil(num_threads)
-    };
+    let chunk_size = pick_chunk_size(len, num_threads);
+
+    // Build the per-call CallContext once and Arc-clone into each Task.
+    let ctx = Arc::new(CallContext {
+        module_name: intern(module_name),
+        func_name: intern(func_name),
+        sys_path_id: sys_path_id(&sys_path),
+        sys_path: Arc::new(sys_path),
+    });
+
     let mut tasks_done = Vec::new();
 
     if is_float {
@@ -283,9 +380,7 @@ fn execute<'py>(
             tasks_done.push(done.clone());
 
             let task = Task {
-                module_name: module_name.to_string(),
-                func_name: func_name.to_string(),
-                sys_path: sys_path.clone(),
+                ctx: ctx.clone(),
                 data: DataType::Float64 {
                     input_ptr: chunk.as_ptr(),
                     output_ptr: mut_out_chunk.as_mut_ptr(),
@@ -294,7 +389,6 @@ fn execute<'py>(
                 done,
             };
 
-            // Push work to the shared queue
             let tx = &pool.0;
             tx.send(WorkerMessage::Task(task))
                 .map_err(|_| PyRuntimeError::new_err("Worker thread panicked or died"))?;
@@ -331,9 +425,7 @@ fn execute<'py>(
             tasks_done.push(done.clone());
 
             let task = Task {
-                module_name: module_name.to_string(),
-                func_name: func_name.to_string(),
-                sys_path: sys_path.clone(),
+                ctx: ctx.clone(),
                 data: DataType::Int64 {
                     input_ptr: chunk.as_ptr(),
                     output_ptr: mut_out_chunk.as_mut_ptr(),
@@ -342,7 +434,6 @@ fn execute<'py>(
                 done,
             };
 
-            // Push work to the shared queue
             let tx = &pool.0;
             tx.send(WorkerMessage::Task(task))
                 .map_err(|_| PyRuntimeError::new_err("Worker thread panicked or died"))?;
@@ -366,12 +457,10 @@ fn shutdown_workers(py: Python) {
     py.detach(|| {
         if let Some((tx, pool)) = WORKER_POOL.get() {
             let num_threads = pool.len();
-            // Send exactly one shutdown message per worker thread
             for _ in 0..num_threads {
                 let _ = tx.send(WorkerMessage::Shutdown);
             }
 
-            // Then join them all to ensure Py_EndInterpreter is done safely
             for mutex_handle in pool {
                 if let Ok(mut handle_opt) = mutex_handle.lock()
                     && let Some(handle) = handle_opt.take()

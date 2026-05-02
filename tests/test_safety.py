@@ -4,9 +4,15 @@ import tasks
 import sys
 import time
 
-def fake_main_func(x): 
+def fake_main_func(x):
     return x
 fake_main_func.__module__ = "__main__"
+
+def fake_main_unroutable(x):
+    s = 0
+    for i in range(int(x)):
+        s += i * x
+    return s
 
 def faulty_func(x):
     raise ValueError("Something went terribly wrong")
@@ -24,20 +30,44 @@ sys.modules['fake_module'] = type('Fake', (), {
 faulty_func.__module__ = 'fake_module'
 fail_fast_then_sleep.__module__ = 'fake_module'
 
-def test_lambda_rejection():
-    with pytest.raises(ValueError, match="does not support lambda functions"):
-        gilmap.map(lambda x: x*2, [1, 2, 3])
+def test_lambda_with_routable_body_now_works():
+    # Post-router: a lambda whose body is Arrow-kernel-shape is accepted.
+    # The router lowers it to pyarrow.compute and never reaches the
+    # sub-interpreter pool, so the importability requirement does not apply.
+    out = gilmap.map(lambda x: x * 2, [1, 2, 3])
+    assert out == [2, 4, 6]
 
-def test_local_function_rejection():
+def test_lambda_with_unroutable_body_rejected():
+    # Lambdas whose bodies the router can't lower must still be rejected
+    # because they would fall through to the sub-interpreter path.
+    with pytest.raises(ValueError, match="does not support lambda"):
+        gilmap.map(lambda x: sum(range(int(x))), [1, 2, 3])
+
+def test_local_function_with_routable_body_now_works():
+    # Same logic for nested/local functions.
     def local_func(x):
         return x * 2
+    assert gilmap.map(local_func, [1, 2, 3]) == [2, 4, 6]
 
-    with pytest.raises(ValueError, match="does not support local functions"):
-        gilmap.map(local_func, [1, 2, 3])
+def test_local_function_with_unroutable_body_rejected():
+    def local_acc(x):
+        acc = 0
+        for i in range(int(x)):
+            acc += i
+        return acc
+    with pytest.raises(ValueError, match="local"):
+        gilmap.map(local_acc, [1, 2, 3])
 
-def test_main_module_rejection():
-    with pytest.raises(ValueError, match="cannot execute functions defined in the __main__ script"):
-        gilmap.map(fake_main_func, [1, 2, 3])
+def test_main_module_function_with_routable_body_now_works():
+    # __main__-defined fns get the same router treatment when the body lowers.
+    assert gilmap.map(fake_main_func, [1, 2, 3]) == [1, 2, 3]
+
+def test_main_module_function_with_unroutable_body_rejected():
+    # Promoted to module level (no <locals> in qualname) so the check the
+    # test asserts (__main__ module rejection) is the one that fires.
+    fake_main_unroutable.__module__ = "__main__"
+    with pytest.raises(ValueError, match="__main__"):
+        gilmap.map(fake_main_unroutable, [1, 2, 3])
 
 def test_invalid_array_type():
     with pytest.raises(TypeError, match="currently only supports arrays of integers"):

@@ -51,12 +51,8 @@ Repository = "https://github.com/pratikbhadane/gilmap"
 Issues = "https://github.com/pratikbhadane/gilmap/issues"
 
 [tool.maturin]
-# Mixed Python/Rust project: gilmap/ sits at the repo root.
-python-source = "."
-python-packages = ["gilmap"]
-# Keep dev-only directories out of the published wheel.
-# Use sdist-include / exclude rather than wholesale path patterns so
-# the gilmap/ Python package still ships.
+# Maturin auto-discovers the `gilmap/` Python package next to pyproject.toml.
+# Keep dev-only directories out of the published wheel/sdist.
 exclude = [
     { path = "benchmarks/**/*", format = ["wheel", "sdist"] },
     { path = "phases/**/*", format = ["wheel", "sdist"] },
