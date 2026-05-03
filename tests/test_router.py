@@ -33,14 +33,10 @@ def f_arrow_math(x):
 
 
 def f_unsupported(x):
-    # while-loop is outside JIT v2 whitelist (only for-range supported);
-    # falls through to sub-interpreter.
-    acc = 0
-    n = x
-    while n > 0:
-        acc += n
-        n -= 1
-    return acc
+    # Comprehension is outside JIT whitelist (and likely always will be —
+    # generators don't lower cleanly to native code); falls through to
+    # sub-interpreter.
+    return sum(i * x for i in range(int(x) + 1))
 
 
 def test_explain_arrow_kernel_simple_arith():

@@ -1,14 +1,11 @@
 //! Cranelift JIT.
 //!
-//! v1 (P5a): single-`return <expr>` numeric bodies.
-//! v2 (P5b): multi-statement bodies — local assigns, counted
-//! `for i in range(N)` loops, and if-statements with early return.
-//! That set covers `mandelbrot_iters` and friends.
-//!
 //! Compiled signature is `extern "C" fn(*const T_in, *mut T_out, len: usize)`.
 //! Per element: load input → run body with locals + control flow → store
 //! into the output slot at the same index. Early `return` inside the body
 //! breaks out of all enclosing loops via a per-element exit block.
+//! Supports single-expression bodies plus multi-statement bodies with
+//! local assigns, `for`/`while` loops, `if`/`else`, and `break`/`continue`.
 
 use crate::ast_ir::{BinOp, CmpOp, Dtype, Expr, Kernel, MathFn, Stmt, UnaryOp};
 use cranelift_codegen::ir::{
@@ -160,6 +157,7 @@ fn compile(kernel: &Kernel) -> Result<Compiled, String> {
             result_var,
             elem_exit,
             terminated: false,
+            loops: Vec::new(),
         };
         lowerer.lower_body(&kernel.body)?;
 
@@ -210,6 +208,16 @@ fn compile(kernel: &Kernel) -> Result<Compiled, String> {
     })
 }
 
+/// Per-loop context for `break`/`continue` targeting. `header_block` is
+/// the block control-flow returns to each iteration. For for-range loops
+/// it's a synthetic increment block that bumps the counter and re-checks
+/// bounds; for while loops it's the cond-eval block.
+#[derive(Clone, Copy)]
+struct LoopFrame {
+    header_block: Block,
+    exit_block: Block,
+}
+
 struct Lowerer<'a, 'b> {
     builder: &'a mut FunctionBuilder<'b>,
     module: &'a mut JITModule,
@@ -219,11 +227,12 @@ struct Lowerer<'a, 'b> {
     locals: HashMap<String, (Variable, Dtype)>,
     result_var: Variable,
     elem_exit: Block,
-    /// True when the current block has been terminated (jump/brif/return)
-    /// — Cranelift forbids appending instructions to a filled block, so
-    /// callers gate further emission on this. Reset whenever
-    /// `switch_to_block` moves us to a fresh block.
+    /// True when the current block has been terminated (jump/brif/return).
+    /// Reset by callers when they switch to a fresh block.
     terminated: bool,
+    /// Stack of enclosing loops; innermost is the last entry. break/continue
+    /// target the innermost frame.
+    loops: Vec<LoopFrame>,
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {
@@ -262,23 +271,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.builder.ins().jump(self.elem_exit, &[]);
                 self.terminated = true;
             }
-            Stmt::IfReturn { test, value } => {
-                let cond = self.lower_expr(test, Dtype::I64)?;
-                let then_block = self.builder.create_block();
-                let cont_block = self.builder.create_block();
-                self.builder.ins().brif(cond, then_block, &[], cont_block, &[]);
-
-                self.builder.switch_to_block(then_block);
-                self.terminated = false;
-                let v = self.lower_expr(value, self.output_dtype)?;
-                self.builder.def_var(self.result_var, v);
-                self.builder.ins().jump(self.elem_exit, &[]);
-                // then_block is now filled.
-
-                self.builder.switch_to_block(cont_block);
-                self.terminated = false;
-            }
-            Stmt::ForRange { var, end, body } => {
+            Stmt::ForRange { var, start, end, body } => {
+                let start_val = self.lower_expr(start, Dtype::I64)?;
                 let end_val = self.lower_expr(end, Dtype::I64)?;
                 let counter = if let Some((existing, _)) = self.locals.get(var) {
                     *existing
@@ -287,8 +281,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     self.locals.insert(var.clone(), (new_var, Dtype::I64));
                     new_var
                 };
-                let zero = self.builder.ins().iconst(types::I64, 0);
-                self.builder.def_var(counter, zero);
+                self.builder.def_var(counter, start_val);
 
                 let header = self.builder.create_block();
                 let body_block = self.builder.create_block();
@@ -306,19 +299,103 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 );
                 self.builder.ins().brif(cont, body_block, &[], exit, &[]);
 
+                // `continue` inside the body needs to bump the counter
+                // before re-checking the bound. Route it through a synthetic
+                // increment block so the LoopFrame's header_block already
+                // advances the counter.
+                let inc_block = self.builder.create_block();
+                self.builder.switch_to_block(inc_block);
+                self.terminated = false;
+                let i_now = self.builder.use_var(counter);
+                let one = self.builder.ins().iconst(types::I64, 1);
+                let i_next = self.builder.ins().iadd(i_now, one);
+                self.builder.def_var(counter, i_next);
+                self.builder.ins().jump(header, &[]);
+
                 self.builder.switch_to_block(body_block);
                 self.terminated = false;
+                self.loops.push(LoopFrame {
+                    header_block: inc_block,
+                    exit_block: exit,
+                });
                 self.lower_body(body)?;
+                self.loops.pop();
                 if !self.terminated {
-                    let i_now = self.builder.use_var(counter);
-                    let one = self.builder.ins().iconst(types::I64, 1);
-                    let i_next = self.builder.ins().iadd(i_now, one);
-                    self.builder.def_var(counter, i_next);
+                    self.builder.ins().jump(inc_block, &[]);
+                }
+
+                self.builder.switch_to_block(exit);
+                self.terminated = false;
+            }
+            Stmt::While { cond, body } => {
+                let header = self.builder.create_block();
+                let body_block = self.builder.create_block();
+                let exit = self.builder.create_block();
+
+                self.builder.ins().jump(header, &[]);
+
+                self.builder.switch_to_block(header);
+                self.terminated = false;
+                let cond_val = self.lower_expr(cond, Dtype::I64)?;
+                self.builder.ins().brif(cond_val, body_block, &[], exit, &[]);
+
+                self.builder.switch_to_block(body_block);
+                self.terminated = false;
+                self.loops.push(LoopFrame {
+                    header_block: header,
+                    exit_block: exit,
+                });
+                self.lower_body(body)?;
+                self.loops.pop();
+                if !self.terminated {
                     self.builder.ins().jump(header, &[]);
                 }
 
                 self.builder.switch_to_block(exit);
                 self.terminated = false;
+            }
+            Stmt::If { test, then_body, else_body } => {
+                let cond = self.lower_expr(test, Dtype::I64)?;
+                let then_block = self.builder.create_block();
+                let else_block = self.builder.create_block();
+                let cont_block = self.builder.create_block();
+                self.builder
+                    .ins()
+                    .brif(cond, then_block, &[], else_block, &[]);
+
+                self.builder.switch_to_block(then_block);
+                self.terminated = false;
+                self.lower_body(then_body)?;
+                if !self.terminated {
+                    self.builder.ins().jump(cont_block, &[]);
+                }
+
+                self.builder.switch_to_block(else_block);
+                self.terminated = false;
+                self.lower_body(else_body)?;
+                if !self.terminated {
+                    self.builder.ins().jump(cont_block, &[]);
+                }
+
+                self.builder.switch_to_block(cont_block);
+                self.terminated = false;
+            }
+            Stmt::Break => {
+                let frame = self
+                    .loops
+                    .last()
+                    .ok_or("`break` outside of any loop".to_string())?;
+                let exit = frame.exit_block;
+                self.builder.ins().jump(exit, &[]);
+                self.terminated = true;
+            }
+            Stmt::Continue => {
+                let frame = self
+                    .loops
+                    .last()
+                    .ok_or("`continue` outside of any loop".to_string())?;
+                self.builder.ins().jump(frame.header_block, &[]);
+                self.terminated = true;
             }
         }
         Ok(())
@@ -351,7 +428,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.coerce(v, Dtype::F64, expected)
             }
             Expr::ConstBool { value } => {
-                self.builder.ins().iconst(types::I8, if *value { 1 } else { 0 })
+                // Booleans are stored as i64 across the JIT to keep dtype
+                // bookkeeping uniform with other ints. Codegen for `brif`
+                // accepts any integer type.
+                self.builder.ins().iconst(types::I64, if *value { 1 } else { 0 })
             }
             Expr::Unary { op, operand } => {
                 let v = self.lower_expr(operand, expected)?;
@@ -551,12 +631,28 @@ fn register_libm_symbols(builder: &mut JITBuilder) {
     builder.symbol("pow", pow as *const u8);
 }
 
-/// Invoke a previously compiled kernel.
+type KernelFn = unsafe extern "C" fn(*const u8, *mut u8, usize);
+
+#[inline]
+unsafe fn as_kernel_fn(fn_ptr: usize) -> KernelFn {
+    unsafe { std::mem::transmute(fn_ptr) }
+}
+
+/// Invoke a kernel in parallel by splitting the input buffer into
+/// `num_threads * 4` chunks and dispatching across rayon's global pool.
+/// JITed code is pure native and holds no GIL, so we get true parallelism
+/// without the sub-interpreter pool's per-call overhead.
+///
+/// Pointers are passed across thread boundaries as `usize`s — Rust's
+/// auto-trait inference rejects raw pointers in Send closures, but
+/// integers carry through fine and we re-cast inside each worker. Per
+/// chunk owns a disjoint sub-slice of the caller-owned buffer, so there's
+/// no aliasing.
 ///
 /// # Safety
-/// Caller must ensure the buffers match the kernel's input/output dtype
-/// and have at least `len` elements each.
-pub unsafe fn invoke_kernel(
+/// Same as `invoke_kernel`: buffers must match `in_dtype`/`out_dtype`
+/// and `len` must be ≤ both buffer sizes.
+pub unsafe fn invoke_kernel_parallel(
     kernel_hash: u64,
     in_dtype: Dtype,
     out_dtype: Dtype,
@@ -564,12 +660,52 @@ pub unsafe fn invoke_kernel(
     out_ptr: *mut u8,
     len: usize,
 ) -> Result<(), String> {
+    if len == 0 {
+        return Ok(());
+    }
     let fn_ptr = lookup(kernel_hash)
         .ok_or_else(|| format!("kernel {} not registered", kernel_hash))?;
-    // The Cranelift function takes opaque pointers; just transmute.
-    type Fn = unsafe extern "C" fn(*const u8, *mut u8, usize);
-    let f: Fn = unsafe { std::mem::transmute(fn_ptr) };
-    unsafe { f(in_ptr, out_ptr, len) };
-    let _ = (in_dtype, out_dtype); // dtype consumed by caller for buffer sizing
+
+    let num_threads = rayon::current_num_threads().max(1);
+    // Below 1 element per worker, single-thread dispatch beats spawn
+    // overhead. Don't scale this with chunk size: per-element compute
+    // weight is unknown, and one heavy element per worker is still worth
+    // it when the kernel runs in milliseconds.
+    if len < num_threads {
+        let f = unsafe { as_kernel_fn(fn_ptr) };
+        unsafe { f(in_ptr, out_ptr, len) };
+        return Ok(());
+    }
+
+    let in_size = dtype_size(in_dtype);
+    let out_size = dtype_size(out_dtype);
+    // 4× chunks per worker so fast workers steal from busy ones via
+    // rayon's work-stealing queue.
+    let target_chunks = (num_threads * 4).min(len);
+    let chunk_size = len.div_ceil(target_chunks).max(1);
+
+    let in_addr = in_ptr as usize;
+    let out_addr = out_ptr as usize;
+
+    rayon::scope(|s| {
+        let mut start = 0usize;
+        while start < len {
+            let this = (len - start).min(chunk_size);
+            let chunk_in = in_addr + start * in_size;
+            let chunk_out = out_addr + start * out_size;
+            s.spawn(move |_| {
+                let f = unsafe { as_kernel_fn(fn_ptr) };
+                unsafe { f(chunk_in as *const u8, chunk_out as *mut u8, this) };
+            });
+            start += this;
+        }
+    });
     Ok(())
+}
+
+#[inline]
+fn dtype_size(d: Dtype) -> usize {
+    match d {
+        Dtype::I64 | Dtype::F64 => 8,
+    }
 }

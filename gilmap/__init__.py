@@ -90,7 +90,8 @@ def _to_arrow(iterable: Iterable | pa.Array) -> tuple[pa.Array, bool]:
         iterable = pa.array(iterable)
         return_list = True
 
-    # Tier-1: skip cast when dtype already matches.
+    # Skip the cast when dtype already matches — pyarrow's cast() always
+    # allocates a new buffer even for a no-op, which dominates small-N.
     arr_type = iterable.type
     if pa.types.is_float64(arr_type) or pa.types.is_int64(arr_type):
         pass
@@ -139,17 +140,9 @@ def map(
     # directly and skip the sub-interpreter pool entirely.
     if decision.fast_path is not None:
         result = decision.fast_path(func, arr)
-        # Coerce result to expected output type (int64/float64) to keep
-        # downstream byte-equality checks clean.
-        if pa.types.is_float64(arr.type) and not pa.types.is_float64(result.type):
-            result = result.cast(pa.float64())
-        elif pa.types.is_int64(arr.type) and not pa.types.is_int64(result.type):
-            try:
-                result = result.cast(pa.int64())
-            except pa.ArrowInvalid:
-                # Some kernels (e.g. divide on ints) return floats — preserve
-                # the kernel-native dtype rather than lossy-cast.
-                pass
+        # Backends own their output dtype — JIT may return i64 for an f64
+        # input when the function does `return int(...)`. Don't lossy-cast
+        # back to the input lane.
         if return_list:
             return result.to_pylist()
         return result

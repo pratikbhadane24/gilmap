@@ -1,30 +1,30 @@
 """Aggressive auto-router: pick the fastest backend for a given user callable.
 
 Detection order (fastest first; first match wins):
-    1. numba @njit / cfunc / ctypes / cffi → call native pointer in worker loop
-    2. Arrow-kernel-shape AST → lower to pyarrow.compute (one C call for whole array)
-    3. Cranelift JIT (whitelisted AST subset) — SKELETON, falls through for now
-    4. Sub-interpreter path (current Rust pool)
+    1. arrow_kernel — single-expr body of supported numeric ops → pyarrow.compute
+    2. numba_native — `@njit`/`@cfunc` callable → cached numba dispatcher
+    3. jit         — multi-statement numeric body → Cranelift JIT
+    4. subinterp   — fallback: per-worker Python sub-interpreter pool
 
-The router caches its decision per-callable on a weakref so repeat calls are free.
+Decisions are cached on a weakref so repeat calls hit O(1).
 
-Public surface lives in gilmap/__init__.py via:
-    gilmap.map(func, iter, *, debug=False)        # transparent dispatch
-    gilmap.explain(func)                           # introspect chosen backend
+Public surface lives in gilmap/__init__.py:
+    gilmap.map(func, iter, *, debug=False)
+    gilmap.explain(func)
 """
 
 from __future__ import annotations
 
 import ast
-import inspect
 import os
-import textwrap
 import weakref
 from dataclasses import dataclass
 from typing import Any, Callable
 
 import pyarrow as pa
 import pyarrow.compute as pc
+
+from . import _ast_utils
 
 # ----------------------------------------------------------------------
 # Decision record
@@ -127,12 +127,14 @@ def _detect_numba(func: Callable) -> BackendDecision | None:
 # Single-expression functions of form `lambda x: x*c + d` (or any chain of
 # the supported binops over `x` and constants) lower to one or more
 # pyarrow.compute calls — the whole array is processed in a single C call.
+# pyarrow.compute kernels keyed by AST node class. ast.Mod intentionally
+# absent — pyarrow has no kernel matching Python's `%` semantics for
+# negatives; the JIT backend handles `%` via Cranelift `srem`.
 _BINOPS = {
     ast.Add: pc.add,
     ast.Sub: pc.subtract,
     ast.Mult: pc.multiply,
     ast.Div: pc.divide,
-    ast.Mod: pc.divide,  # NOTE: pc.divide ≠ python %; we'll explicitly skip Mod below
     ast.Pow: pc.power,
     ast.BitAnd: pc.bit_wise_and,
     ast.BitOr: pc.bit_wise_or,
@@ -160,57 +162,20 @@ _MATH_CALLS = {
 }
 
 
-def _get_source(func: Callable) -> str | None:
-    try:
-        src = inspect.getsource(func)
-    except (OSError, TypeError):
-        return None
-    return textwrap.dedent(src)
-
-
 def _func_body_expr(func: Callable) -> tuple[ast.expr, str] | None:
-    """If `func` body is a single `return <expr>`, return (expr, param_name).
-    None otherwise.
-    """
-    src = _get_source(func)
-    if src is None:
-        return None
-    try:
-        tree = ast.parse(src)
-    except SyntaxError:
-        return None
-    if not tree.body:
-        return None
-    # `inspect.getsource(lambda)` returns the source line including any
-    # surrounding assignment (`f = lambda x: ...`). Walk the tree to find
-    # the FunctionDef or Lambda we actually care about.
-    fn_node: ast.FunctionDef | ast.Lambda | None = None
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.Lambda)):
-            fn_node = node
-            break
+    """Single-`return <expr>` body → (expr, param_name). None otherwise."""
+    fn_node = _ast_utils.find_fn_node(func)
     if fn_node is None:
         return None
-    if isinstance(fn_node, ast.Lambda):
-        params = fn_node.args.args
-        body = fn_node.body
-    else:
-        params = fn_node.args.args
-        # Strip a leading docstring (Expr(Constant(str))) so functions with
-        # a single `return <expr>` after their docstring still lower.
-        stmts = fn_node.body
-        if (
-            stmts
-            and isinstance(stmts[0], ast.Expr)
-            and isinstance(stmts[0].value, ast.Constant)
-            and isinstance(stmts[0].value.value, str)
-        ):
-            stmts = stmts[1:]
-        if len(stmts) != 1 or not isinstance(stmts[0], ast.Return):
-            return None
-        body = stmts[0].value
+    params = fn_node.args.args
     if len(params) != 1:
         return None
+    if isinstance(fn_node, ast.Lambda):
+        return fn_node.body, params[0].arg
+    stmts = _ast_utils.strip_docstring(fn_node.body)
+    if len(stmts) != 1 or not isinstance(stmts[0], ast.Return):
+        return None
+    body = stmts[0].value
     if body is None:
         return None
     return body, params[0].arg
@@ -320,15 +285,14 @@ def _detect_arrow_kernel(func: Callable) -> BackendDecision | None:
 # ----------------------------------------------------------------------
 
 def _detect_jit(func: Callable) -> BackendDecision | None:
-    """Cranelift JIT. v2 (P5b) handles multi-statement bodies with local
-    assigns, counted `for i in range(N)` loops, and `if cond: return X`
-    early returns. v1 (P5a) single-expression bodies still work via the
-    same code path — the walker emits a single-`return` body for those.
+    """Cranelift JIT for numeric bodies: single-expression returns plus
+    multi-statement bodies with locals, `for`/`while` loops, `if`/`else`
+    (incl. early return), `break`, and `continue`.
 
-    Order in the detector chain: runs *after* arrow_kernel. arrow_kernel's
-    pyarrow.compute kernels beat per-element native code for the simple
-    vectorizable shapes both backends support, so JIT only fires for
-    shapes arrow_kernel rejects (loops, locals, early-return, integer `%`).
+    Runs *after* arrow_kernel because pyarrow.compute's hand-tuned SIMD
+    kernels beat per-element native code on the trivially vectorizable
+    shapes both backends share. JIT activates for shapes arrow_kernel
+    rejects: loops, locals, early-return, integer `%`.
     """
     from . import _jit
 

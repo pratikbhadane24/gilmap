@@ -511,7 +511,7 @@ fn jit_apply<'py>(
         ast_ir::Dtype::F64 => {
             let mut out = vec![0f64; len];
             unsafe {
-                jit::invoke_kernel(
+                jit::invoke_kernel_parallel(
                     kernel_hash,
                     in_d,
                     out_d,
@@ -526,7 +526,7 @@ fn jit_apply<'py>(
         ast_ir::Dtype::I64 => {
             let mut out = vec![0i64; len];
             unsafe {
-                jit::invoke_kernel(
+                jit::invoke_kernel_parallel(
                     kernel_hash,
                     in_d,
                     out_d,

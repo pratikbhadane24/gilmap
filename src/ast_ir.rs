@@ -1,10 +1,7 @@
-//! Typed IR shared between the Python AST walker (gilmap/_jit.py)
-//! and the Cranelift codegen in `jit.rs`.
-//!
-//! v1 (P5a): single-`return <expr>` bodies.
-//! v2 (P5b): multi-statement bodies with local assigns, counted
-//! `for i in range(N)` loops, and if-statements with early return.
-//! That's the shape `mandelbrot_iters` needs.
+//! Typed IR shared between the Python AST walker (gilmap/_jit.py) and the
+//! Cranelift codegen in `jit.rs`. Covers single-`return <expr>` bodies plus
+//! multi-statement bodies with local assigns, `for`/`while` loops,
+//! `if`/`else` (incl. early return), and `break`/`continue`.
 
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +58,7 @@ pub enum MathFn {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)]
 pub enum Expr {
     /// Function input (single arg).
     Param,
@@ -86,19 +84,24 @@ pub enum Expr {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Stmt {
-    /// `name = value` — declare or overwrite a local. `dtype` is the type
-    /// of the value (inferred by the walker, also used by codegen to
-    /// declare a Cranelift Variable on first assignment).
+    /// `name = value`. `dtype` is inferred by the walker.
     Assign { name: String, dtype: Dtype, value: Expr },
-    /// `for var in range(end): body` — counted loop with i64 counter.
-    /// `end` may be a Local read (e.g. `range(max_iter)`) or a constant
-    /// expression evaluated once before the loop.
-    ForRange { var: String, end: Expr, body: Vec<Stmt> },
-    /// `if test: return value` — emitted by the walker for the common
-    /// early-return-inside-loop pattern.
-    IfReturn { test: Expr, value: Expr },
-    /// `return value` — final return at end of body or branch.
+    /// `for var in range(start, end):` — both bounds may be constants or
+    /// expressions evaluated once before the loop. v1 single-arg form
+    /// emits `start = ConstI64(0)`. Step is fixed at 1; explicit step is
+    /// future work.
+    ForRange { var: String, start: Expr, end: Expr, body: Vec<Stmt> },
+    /// `while cond: body` — re-evaluates `cond` each iteration.
+    While { cond: Expr, body: Vec<Stmt> },
+    /// `if test: then` or `if test: then; else: orelse`. Both branches
+    /// are arbitrary statement lists.
+    If { test: Expr, then_body: Vec<Stmt>, else_body: Vec<Stmt> },
+    /// `return value`.
     Return { value: Expr },
+    /// `break` — jumps to the exit block of the innermost enclosing loop.
+    Break,
+    /// `continue` — jumps to the header block of the innermost enclosing loop.
+    Continue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

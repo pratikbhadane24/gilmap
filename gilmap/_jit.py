@@ -1,32 +1,23 @@
 """Python AST → typed-IR JSON marshaller for the Cranelift JIT backend.
 
-v1 (P5a): single-`return <expr>` numeric bodies.
-v2 (P5b): multi-statement bodies with local `Assign`, counted
-`for i in range(N): ...`, `if cond: return X`, and final `return X`.
-That's the shape `mandelbrot_iters` needs.
+The walker handles single-`return <expr>` bodies and multi-statement bodies
+with local `Assign`/`AugAssign`, counted `for i in range(...)` loops, `while`
+loops, `if`/`else` (incl. `if cond: return X`), `break`, and `continue`.
 
-The walker performs lightweight type inference per local variable so that
-each `Assign` carries an `i64` or `f64` `dtype` tag in the IR. Inference
-rules (intentionally conservative — bail on ambiguity):
-  - `int(...)` literal → i64
-  - `float(...)` literal → f64
-  - `math.X(...)` call → f64
-  - Local read → the type recorded when the local was assigned
-  - `Param` → kernel input dtype
-  - BinOp/Unary/Compare/IfExpr → propagate operand types; if either
-    operand is f64, the result is f64; both i64 → i64. (Mod/FloorDiv on
-    f64 fail; codegen also rejects.)
+Type inference is per local: each `Assign` carries an `i64`/`f64` `dtype` tag.
+Promotion is conservative — `BinOp`/`Compare`/`IfExpr` lift to f64 when either
+operand is f64; otherwise stay i64.
 """
 
 from __future__ import annotations
 
 import ast
-import inspect
 import json
-import textwrap
 from typing import Callable
 
 from _gilmap import jit_apply, jit_compile
+
+from . import _ast_utils
 
 
 _BINOP_MAP = {
@@ -65,14 +56,30 @@ class _LowerError(Exception):
     pass
 
 
+def _cast(node: dict, target: str) -> dict:
+    return {"kind": f"cast_to_{target}", "value": node}
+
+
+def _promote(left: dict, lt: str, right: dict, rt: str) -> tuple[dict, dict, str]:
+    """Lift mixed-dtype operands to a common type. f64 wins over i64."""
+    if lt == rt:
+        return left, right, lt
+    if lt == "i64":
+        left = _cast(left, "f64")
+    if rt == "i64":
+        right = _cast(right, "f64")
+    return left, right, "f64"
+
+
 class _Walker:
     def __init__(self, param_name: str, input_dtype: str):
         self.param = param_name
         self.input_dtype = input_dtype
-        # name -> "i64" | "f64"
         self.locals: dict[str, str] = {}
-
-    # --- expression lowering + inference -----------------------------
+        # Output dtype is whatever the first reachable Return assigns.
+        # Subsequent Returns must agree (codegen requires a single output
+        # dtype per kernel).
+        self.output_dtype: str | None = None
 
     def expr(self, node: ast.expr) -> tuple[dict, str]:
         """Returns (ir_node, dtype). dtype is "i64" or "f64"."""
@@ -100,16 +107,7 @@ class _Walker:
                 raise _LowerError(f"binop {type(node.op).__name__} not supported")
             left, lt = self.expr(node.left)
             right, rt = self.expr(node.right)
-            # Promotion: if either side is f64, both lift to f64.
-            if lt == "f64" or rt == "f64":
-                if lt == "i64":
-                    left = {"kind": "cast_to_f64", "value": left}
-                if rt == "i64":
-                    right = {"kind": "cast_to_f64", "value": right}
-                result_dt = "f64"
-            else:
-                result_dt = "i64"
-            # FloorDiv/Mod on f64 are not supported by codegen; reject early.
+            left, right, result_dt = _promote(left, lt, right, rt)
             if isinstance(node.op, (ast.FloorDiv, ast.Mod)) and result_dt == "f64":
                 raise _LowerError("f64 floor/mod not supported in JIT")
             return {
@@ -125,30 +123,18 @@ class _Walker:
                 raise _LowerError("comparison op not supported")
             left, lt = self.expr(node.left)
             right, rt = self.expr(node.comparators[0])
-            if lt == "f64" or rt == "f64":
-                if lt == "i64":
-                    left = {"kind": "cast_to_f64", "value": left}
-                if rt == "i64":
-                    right = {"kind": "cast_to_f64", "value": right}
+            left, right, _ = _promote(left, lt, right, rt)
             return {
                 "kind": "compare",
                 "op": _CMP_MAP[type(node.ops[0])],
                 "left": left,
                 "right": right,
-            }, "i64"  # boolean — i8 in Cranelift, but i64 in our IR vocab
+            }, "i64"
         if isinstance(node, ast.IfExp):
             test, _ = self.expr(node.test)
             yes, yt = self.expr(node.body)
             no, nt = self.expr(node.orelse)
-            if yt != nt:
-                # Promote both to f64 if mixed.
-                if yt == "i64":
-                    yes = {"kind": "cast_to_f64", "value": yes}
-                if nt == "i64":
-                    no = {"kind": "cast_to_f64", "value": no}
-                rt = "f64"
-            else:
-                rt = yt
+            yes, no, rt = _promote(yes, yt, no, nt)
             return {"kind": "if_expr", "test": test, "yes": yes, "no": no}, rt
         if isinstance(node, ast.Call):
             if (
@@ -161,41 +147,34 @@ class _Walker:
             ):
                 arg, at = self.expr(node.args[0])
                 if at == "i64":
-                    arg = {"kind": "cast_to_f64", "value": arg}
+                    arg = _cast(arg, "f64")
                 return {
                     "kind": "math_call",
                     "func": _MATH_MAP[node.func.attr],
                     "arg": arg,
                 }, "f64"
-            # int(x) / float(x) explicit casts.
             if isinstance(node.func, ast.Name) and not node.keywords and len(node.args) == 1:
                 inner, it = self.expr(node.args[0])
                 if node.func.id == "int":
-                    if it == "f64":
-                        inner = {"kind": "cast_to_i64", "value": inner}
-                    return inner, "i64"
+                    return (_cast(inner, "i64") if it == "f64" else inner), "i64"
                 if node.func.id == "float":
-                    if it == "i64":
-                        inner = {"kind": "cast_to_f64", "value": inner}
-                    return inner, "f64"
+                    return (_cast(inner, "f64") if it == "i64" else inner), "f64"
             raise _LowerError(
                 "only math.<sqrt|abs|exp|log|sin|cos|tan|floor|ceil>(arg), int(x), or float(x) calls supported"
             )
         raise _LowerError(f"AST node {type(node).__name__} not supported in JIT")
 
-    # --- statement lowering ------------------------------------------
+    def _record_return(self, dt: str) -> None:
+        if self.output_dtype is None:
+            self.output_dtype = dt
+        elif self.output_dtype != dt:
+            raise _LowerError(
+                f"return-type mismatch: kernel sets {self.output_dtype} then {dt}"
+            )
 
     def stmts(self, body: list[ast.stmt]) -> tuple[list[dict], bool]:
-        """Returns (ir_stmts, terminated). terminated == True if every path
-        through the block ends in a Return."""
-        # Strip leading docstring.
-        if (
-            body
-            and isinstance(body[0], ast.Expr)
-            and isinstance(body[0].value, ast.Constant)
-            and isinstance(body[0].value.value, str)
-        ):
-            body = body[1:]
+        """Returns (ir_stmts, terminated)."""
+        body = _ast_utils.strip_docstring(body)
         out: list[dict] = []
         terminated = False
         for stmt in body:
@@ -215,61 +194,48 @@ class _Walker:
             self.locals[name] = dt
             return {"kind": "assign", "name": name, "dtype": dt, "value": value}, False
         if isinstance(node, ast.AugAssign):
-            # Lower `x += y` to `x = x + y`.
             if not isinstance(node.target, ast.Name):
                 raise _LowerError("augassign target must be a Name")
             name = node.target.id
             if name not in self.locals:
                 raise _LowerError(f"augassign on unknown local '{name}'")
-            ast_op = node.op
-            if type(ast_op) not in _BINOP_MAP:
+            if type(node.op) not in _BINOP_MAP:
                 raise _LowerError("augassign op not supported")
             left, lt = self.expr(ast.Name(id=name, ctx=ast.Load()))
             right, rt = self.expr(node.value)
-            if lt == "f64" or rt == "f64":
-                if lt == "i64":
-                    left = {"kind": "cast_to_f64", "value": left}
-                if rt == "i64":
-                    right = {"kind": "cast_to_f64", "value": right}
-                rdt = "f64"
-            else:
-                rdt = "i64"
-            value = {
-                "kind": "bin_op",
-                "op": _BINOP_MAP[type(ast_op)],
-                "left": left,
-                "right": right,
-            }
-            # Don't change the local's type — keep what it was.
+            left, right, rdt = _promote(left, lt, right, rt)
             existing_dt = self.locals[name]
             if rdt != existing_dt:
-                # AugAssign that changes type is an error in our IR.
                 raise _LowerError(
                     f"augassign would change type of '{name}' from {existing_dt} to {rdt}"
                 )
+            value = {
+                "kind": "bin_op",
+                "op": _BINOP_MAP[type(node.op)],
+                "left": left,
+                "right": right,
+            }
             return {"kind": "assign", "name": name, "dtype": existing_dt, "value": value}, False
         if isinstance(node, ast.Return):
             if node.value is None:
                 raise _LowerError("return with no value not supported")
-            value, _dt = self.expr(node.value)
+            value, dt = self.expr(node.value)
+            self._record_return(dt)
             return {"kind": "return", "value": value}, True
         if isinstance(node, ast.If):
-            # Recognize the `if cond: return X` pattern (no else, single
-            # Return in body). That's the only If shape v2 supports.
-            if (
-                node.orelse == []
-                and len(node.body) == 1
-                and isinstance(node.body[0], ast.Return)
-                and node.body[0].value is not None
-            ):
-                test, _ = self.expr(node.test)
-                value, _ = self.expr(node.body[0].value)
-                return {"kind": "if_return", "test": test, "value": value}, False
-            raise _LowerError(
-                "only `if cond: return X` (single-statement, no else) supported in JIT"
+            test, _ = self.expr(node.test)
+            then_ir, then_term = self.stmts(node.body)
+            else_ir, else_term = self.stmts(node.orelse) if node.orelse else ([], False)
+            return (
+                {
+                    "kind": "if",
+                    "test": test,
+                    "then_body": then_ir,
+                    "else_body": else_ir,
+                },
+                then_term and else_term,
             )
         if isinstance(node, ast.For):
-            # `for var in range(end):` — only the 1-arg form for now.
             if not isinstance(node.target, ast.Name):
                 raise _LowerError("for-loop target must be a Name")
             if node.orelse:
@@ -278,105 +244,61 @@ class _Walker:
                 isinstance(node.iter, ast.Call)
                 and isinstance(node.iter.func, ast.Name)
                 and node.iter.func.id == "range"
-                and len(node.iter.args) == 1
+                and 1 <= len(node.iter.args) <= 2
                 and not node.iter.keywords
             ):
-                raise _LowerError("only `for var in range(end):` supported")
-            end, et = self.expr(node.iter.args[0])
-            if et == "f64":
-                end = {"kind": "cast_to_i64", "value": end}
+                raise _LowerError("only `for var in range(end)` or `range(start, end)` supported")
+            args = node.iter.args
+            if len(args) == 1:
+                start_ir, start_dt = {"kind": "const_i64", "value": 0}, "i64"
+                end_ir, end_dt = self.expr(args[0])
+            else:
+                start_ir, start_dt = self.expr(args[0])
+                end_ir, end_dt = self.expr(args[1])
+            if start_dt == "f64":
+                start_ir = _cast(start_ir, "i64")
+            if end_dt == "f64":
+                end_ir = _cast(end_ir, "i64")
             var_name = node.target.id
             self.locals[var_name] = "i64"
             inner_ir, _ = self.stmts(node.body)
             return (
-                {"kind": "for_range", "var": var_name, "end": end, "body": inner_ir},
+                {
+                    "kind": "for_range",
+                    "var": var_name,
+                    "start": start_ir,
+                    "end": end_ir,
+                    "body": inner_ir,
+                },
                 False,
             )
+        if isinstance(node, ast.While):
+            if node.orelse:
+                raise _LowerError("while-else not supported")
+            cond, _ = self.expr(node.test)
+            inner_ir, _ = self.stmts(node.body)
+            return ({"kind": "while", "cond": cond, "body": inner_ir}, False)
+        if isinstance(node, ast.Break):
+            return ({"kind": "break"}, True)
+        if isinstance(node, ast.Continue):
+            return ({"kind": "continue"}, True)
         raise _LowerError(f"statement {type(node).__name__} not supported in JIT")
-
-
-def _func_def(func: Callable):
-    try:
-        src = inspect.getsource(func)
-    except (OSError, TypeError):
-        return None
-    src = textwrap.dedent(src)
-    try:
-        tree = ast.parse(src)
-    except SyntaxError:
-        return None
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.Lambda)):
-            return node
-    return None
-
-
-def _infer_output_dtype(stmts: list[dict], input_dtype: str) -> str:
-    """Walk the IR looking for Return statements; if any of them yields
-    f64, output_dtype is f64; otherwise i64. Conservative — defaults to
-    input_dtype when no explicit Return is reachable (defensive)."""
-    saw_f64 = False
-    saw_any = False
-    def visit(stmt: dict):
-        nonlocal saw_f64, saw_any
-        if stmt.get("kind") == "return":
-            saw_any = True
-            v = stmt.get("value", {})
-            if _expr_is_f64(v):
-                saw_f64 = True
-        elif stmt.get("kind") == "if_return":
-            saw_any = True
-            v = stmt.get("value", {})
-            if _expr_is_f64(v):
-                saw_f64 = True
-        elif stmt.get("kind") == "for_range":
-            for s in stmt.get("body", []):
-                visit(s)
-    for s in stmts:
-        visit(s)
-    if not saw_any:
-        return input_dtype
-    return "f64" if saw_f64 else "i64"
-
-
-def _expr_is_f64(expr: dict) -> bool:
-    """Best-effort dtype check on an IR expression — only used to decide
-    Return type. Mirrors the walker's promotion rules."""
-    k = expr.get("kind")
-    if k in ("const_f64", "math_call", "cast_to_f64"):
-        return True
-    if k in ("const_i64", "const_bool", "cast_to_i64"):
-        return False
-    if k == "bin_op":
-        return _expr_is_f64(expr["left"]) or _expr_is_f64(expr["right"])
-    if k == "unary":
-        return _expr_is_f64(expr["operand"])
-    if k == "if_expr":
-        return _expr_is_f64(expr["yes"]) or _expr_is_f64(expr["no"])
-    if k == "compare":
-        return False  # boolean-as-int
-    # param/local: we don't track from here. Default to int — consumers
-    # that assigned an f64 would already have set output_dtype from a
-    # different return path.
-    return False
 
 
 def try_compile(func: Callable, input_dtype: str) -> tuple[int, str] | None:
     """Compile `func` if its body fits the JIT whitelist.
 
-    Returns (kernel_hash, output_dtype) on success, None on rejection.
+    Returns ``(kernel_hash, output_dtype)`` on success, ``None`` on rejection.
     `input_dtype` is the dtype of the data being mapped (`"i64"` or `"f64"`).
     """
-    fn_node = _func_def(func)
+    fn_node = _ast_utils.find_fn_node(func)
     if fn_node is None:
         return None
+    params = fn_node.args.args
+    if len(params) != 1:
+        return None
+    walker = _Walker(params[0].arg, input_dtype)
     if isinstance(fn_node, ast.Lambda):
-        # Lambdas: single-expression body only — fall back to v1 path
-        # (single Return).
-        params = fn_node.args.args
-        if len(params) != 1:
-            return None
-        walker = _Walker(params[0].arg, input_dtype)
         try:
             value, dt = walker.expr(fn_node.body)
         except _LowerError:
@@ -384,19 +306,13 @@ def try_compile(func: Callable, input_dtype: str) -> tuple[int, str] | None:
         body_ir = [{"kind": "return", "value": value}]
         out_dt = dt
     else:
-        params = fn_node.args.args
-        if len(params) != 1:
-            return None
-        walker = _Walker(params[0].arg, input_dtype)
         try:
             body_ir, terminated = walker.stmts(fn_node.body)
         except _LowerError:
             return None
         if not terminated:
-            # The kernel may exit without an explicit Return — reject so
-            # codegen doesn't have to invent a default.
             return None
-        out_dt = _infer_output_dtype(body_ir, input_dtype)
+        out_dt = walker.output_dtype or input_dtype
 
     kernel = {"input_dtype": input_dtype, "output_dtype": out_dt, "body": body_ir}
     payload = json.dumps(kernel, sort_keys=True)
