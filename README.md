@@ -1,14 +1,16 @@
 # gilmap
 
-`gilmap` is a Python + Rust parallel map runtime for numeric, single-argument, module-level Python functions.
+`gilmap` is a Python + Rust parallel map runtime for numeric, single-argument Python functions.
 
 It combines:
 
-- Rust worker threads for CPU parallelism
-- Python sub-interpreters (one per worker thread)
+- An auto-router that picks the fastest backend per callable (numba native, pyarrow.compute kernels, Cranelift JIT, or sub-interpreter pool)
+- Rust worker threads + Python sub-interpreters (PEP 684, one per worker) for the general fallback
 - Apache Arrow arrays for efficient Python <-> Rust transfer
 
-The public API is one function: `gilmap.map`.
+Public API: `gilmap.map(func, iterable, *, debug=False)` and `gilmap.explain(func)`.
+
+See `docs/ARCHITECTURE.md` for the layered design and `docs/BACKENDS.md` for the per-backend contract.
 
 ## What it is optimized for
 
@@ -77,7 +79,7 @@ print(type(out))  # pyarrow.Array
 
 ## API reference
 
-### `gilmap.map(func, iterable) -> list | pyarrow.Array`
+### `gilmap.map(func, iterable, *, debug=False) -> list | pyarrow.Array`
 
 Executes `func` over `iterable` in parallel while preserving element order.
 
@@ -87,6 +89,7 @@ Executes `func` over `iterable` in parallel while preserving element order.
 - `iterable`: either
   - a Python iterable of values castable to `int64` or `float64`, or
   - a `pyarrow.Array`
+- `debug`: if `True` (or env `GILMAP_DEBUG=1`), prints the chosen backend per call
 
 #### Return behavior
 
@@ -97,59 +100,56 @@ Executes `func` over `iterable` in parallel while preserving element order.
 
 - Float input (`float32`/`float64`) is cast to `float64`
 - Non-float input is cast to `int64`
-- Callable return values are converted back to the active numeric lane:
-  - integer lane -> `i64` conversion
-  - float lane -> `f64` conversion
+- Backend owns the output dtype. Most backends preserve the input lane; JIT may return `int64` for an `f64` input when the body does `return int(...)`.
+
+### `gilmap.explain(func) -> dict`
+
+Returns the router's decision without executing — `{"backend", "reason", "has_fast_path"}`. Useful to verify which path will fire.
+
+```python
+gilmap.explain(lambda x: x * 2.0 + 1.0)
+# {'backend': 'arrow_kernel', 'reason': '...', 'has_fast_path': True}
+```
 
 ## Callable constraints
 
-Workers import by module + function name inside sub-interpreters. Because of that:
+Constraints depend on the backend the router picks:
 
-- lambdas are rejected
-- local/nested functions are rejected
-- functions defined directly in `__main__` are rejected
+- **`numba_native` / `arrow_kernel` / `jit` fast paths**: lambdas, `__main__` functions, and locals are all fine — the body is lowered to native or pyarrow.compute and never imported into a worker.
+- **`subinterp` fallback**: workers import by module + function name inside sub-interpreters, so lambdas, `<locals>`, and `__main__` functions are rejected. Move them to an importable module.
 
-Put callables in importable modules (for example `tasks.py`) and import them in your entrypoint.
+Use `gilmap.explain(func)` to see which backend will run.
 
 ## Error model
 
 | Exception | Condition |
 | --- | --- |
 | `TypeError` | `func` is not callable |
-| `ValueError` | lambda/local function/`__main__` function used |
+| `ValueError` | lambda/local/`__main__` function routed to the `subinterp` fallback |
 | `TypeError` | input cannot be cast to supported numeric Arrow type |
-| `RuntimeError` | execution/import failure in worker sub-interpreters |
+| `RuntimeError` | execution/import failure in worker sub-interpreters; or `subinterp` fallback hit on a free-threaded (`Py_GIL_DISABLED`) build |
 
 If any worker fails, the whole call fails and no partial result is returned.
 
 ## Architecture
 
-### Python layer (`gilmap/__init__.py`)
+`gilmap.map` runs an auto-router (`gilmap/_router.py`) that picks one of four backends per callable; the decision is cached on a weakref so repeat calls are O(1).
 
-1. Validates callable constraints
-2. Converts/casts input to Arrow (`int64` or `float64`)
-3. Calls Rust extension entrypoint `execute(module_name, func_name, array, sys.path)`
-4. Converts result to list when original input was not Arrow
-5. Registers `shutdown_workers` with `atexit` for clean worker teardown
+| Backend | Selected when | Where work runs |
+|---|---|---|
+| `numba_native` | `func` exposes numba dispatcher metadata or a cfunc `address` | numpy round-trip + cached numba dispatcher |
+| `arrow_kernel` | body is a single `return <expr>` of supported binops/unops/`math.*` | one or more `pyarrow.compute` C calls — whole array at once |
+| `jit` | same shape as `arrow_kernel` plus `%`/`//`/ternary, where arrow_kernel rejects | Cranelift-compiled `extern "C" fn(*const T, *mut T, len)`, hash-cached |
+| `subinterp` | nothing else matches | Rust worker pool, one PEP 684 sub-interpreter per thread, interned `(module, name)` cache, adaptive chunk scheduling |
 
-### Rust layer (`src/lib.rs`)
-
-1. Lazily initializes a global worker pool (`OnceLock`) on first call
-2. Starts one thread per `available_parallelism()`
-3. Creates one Python sub-interpreter per worker thread
-4. Receives chunked tasks over a shared queue
-5. Caches imported function objects per worker (`(module_name, func_name)` key)
-6. Extends worker `sys.path` from caller-provided entries
-7. Executes function for each value in the chunk
-8. Signals completion via `Condvar`
-9. Reassembles chunked output into Arrow array and returns to Python
+Full per-backend contract is in `docs/BACKENDS.md`; the layered execution flow (Python entry → router → fast-path / Rust pool, plus the JIT pipeline) is in `docs/ARCHITECTURE.md`.
 
 ## Worker lifecycle and shutdown
 
-- Worker threads/sub-interpreters are long-lived after first use
-- They are reused across `gilmap.map` calls
+- Sub-interpreter worker threads are long-lived after first use and reused across calls
 - `shutdown_workers` sends one shutdown message per worker and joins threads
-- `shutdown_workers` is automatically called at process exit via `atexit`
+- `shutdown_workers` is automatically registered with `atexit`
+- JIT-compiled kernels are cached by IR hash for the lifetime of the process
 
 ## Testing
 
@@ -229,10 +229,21 @@ The report generator refuses to publish if no losses are recorded — the
 .
 ├── Cargo.toml
 ├── pyproject.toml
-├── src/lib.rs
-├── gilmap/__init__.py
+├── gilmap/
+│   ├── __init__.py         # public API: map(), explain()
+│   ├── _router.py          # backend detectors + weakref decision cache
+│   ├── _jit.py             # Python AST → typed JSON IR for the JIT path
+│   └── _ast_utils.py       # shared AST helpers
+├── src/
+│   ├── lib.rs              # sub-interpreter worker pool + PyO3 bindings
+│   ├── ast_ir.rs           # typed IR shared with _jit.py
+│   └── jit.rs              # Cranelift codegen + per-kernel registry
 ├── tests/
 │   ├── tasks.py
+│   ├── test_router.py
+│   ├── test_jit.py
+│   ├── test_numba_bridge.py
+│   ├── test_free_threaded.py
 │   ├── test_parallel.py
 │   ├── test_safety.py
 │   └── test_heavy.py
@@ -244,6 +255,8 @@ The report generator refuses to publish if no losses are recorded — the
 │   ├── run.py
 │   └── report.py
 └── docs/
+    ├── ARCHITECTURE.md     # layered design, JIT pipeline
+    ├── BACKENDS.md         # per-backend contract
     └── BENCHMARKS.md       # generated; full benchmark report
 ```
 
