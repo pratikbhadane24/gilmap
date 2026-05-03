@@ -13,7 +13,7 @@ import gilmap
 from gilmap import _router
 
 sys.path.insert(0, os.path.dirname(__file__))
-from tasks import slow_square  # noqa: E402  module-level fn for sub-interp path
+from tasks import slow_square, subinterp_only  # noqa: E402
 
 
 def setup_function(_fn):
@@ -33,10 +33,13 @@ def f_arrow_math(x):
 
 
 def f_unsupported(x):
-    # for-loop body, not a single expression — should fall through to subinterp
+    # while-loop is outside JIT v2 whitelist (only for-range supported);
+    # falls through to sub-interpreter.
     acc = 0
-    for i in range(3):
-        acc += i * x
+    n = x
+    while n > 0:
+        acc += n
+        n -= 1
     return acc
 
 
@@ -80,11 +83,12 @@ def test_arrow_kernel_math_sqrt():
 
 
 def test_subinterp_fallback_still_works():
-    # slow_square is module-level — should go through sub-interp pool.
-    d = gilmap.explain(slow_square)
+    # subinterp_only uses a comprehension — outside JIT v2 whitelist, so
+    # routing falls through to sub-interp.
+    d = gilmap.explain(subinterp_only)
     assert d["backend"] == "subinterp"
-    out = gilmap.map(slow_square, list(range(5)))
-    assert out == [x * x for x in range(5)]
+    out = gilmap.map(subinterp_only, [3, 4, 5])
+    assert out == [subinterp_only(x) for x in [3, 4, 5]]
 
 
 def test_decision_cached():

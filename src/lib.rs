@@ -1,3 +1,6 @@
+mod ast_ir;
+mod jit;
+
 use arrow::array::{Array, Float64Array, Int64Array, make_array};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use crossbeam_channel::{Sender, bounded};
@@ -452,6 +455,103 @@ fn execute<'py>(
     }
 }
 
+/// Compile a JIT kernel from JSON-serialized AST IR. Returns a stable
+/// hash that callers pass to `jit_apply`. Idempotent: same JSON yields
+/// the same hash and skips recompilation.
+#[pyfunction]
+fn jit_compile(kernel_json: &str) -> PyResult<u64> {
+    use std::hash::{Hash, Hasher};
+    let kernel: ast_ir::Kernel = serde_json::from_str(kernel_json)
+        .map_err(|e| PyValueError::new_err(format!("invalid kernel JSON: {}", e)))?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    kernel_json.hash(&mut hasher);
+    let h = hasher.finish();
+    if jit::lookup(h).is_some() {
+        return Ok(h);
+    }
+    jit::compile_and_register(&kernel, h).map_err(PyRuntimeError::new_err)?;
+    Ok(h)
+}
+
+/// Apply a previously compiled JIT kernel to an Arrow array. Dispatches
+/// on (input_dtype, output_dtype) pair — they may differ (e.g. mandelbrot
+/// takes f64, returns i64).
+#[pyfunction]
+fn jit_apply<'py>(
+    py: Python<'py>,
+    kernel_hash: u64,
+    in_dtype: &str,
+    out_dtype: &str,
+    array: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let array_data = arrow::array::ArrayData::from_pyarrow_bound(&array)
+        .map_err(|e| PyValueError::new_err(format!("Failed to parse Arrow array: {}", e)))?;
+    let arrow_array = make_array(array_data);
+    let len = arrow_array.len();
+
+    let in_d = parse_dtype(in_dtype)?;
+    let out_d = parse_dtype(out_dtype)?;
+
+    let input_ptr: *const u8 = match in_d {
+        ast_ir::Dtype::F64 => arrow_array
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| PyValueError::new_err("input array dtype mismatch: expected Float64"))?
+            .values()
+            .as_ptr() as *const u8,
+        ast_ir::Dtype::I64 => arrow_array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| PyValueError::new_err("input array dtype mismatch: expected Int64"))?
+            .values()
+            .as_ptr() as *const u8,
+    };
+
+    match out_d {
+        ast_ir::Dtype::F64 => {
+            let mut out = vec![0f64; len];
+            unsafe {
+                jit::invoke_kernel(
+                    kernel_hash,
+                    in_d,
+                    out_d,
+                    input_ptr,
+                    out.as_mut_ptr() as *mut u8,
+                    len,
+                )
+                .map_err(PyRuntimeError::new_err)?;
+            }
+            Float64Array::from(out).into_data().to_pyarrow(py)
+        }
+        ast_ir::Dtype::I64 => {
+            let mut out = vec![0i64; len];
+            unsafe {
+                jit::invoke_kernel(
+                    kernel_hash,
+                    in_d,
+                    out_d,
+                    input_ptr,
+                    out.as_mut_ptr() as *mut u8,
+                    len,
+                )
+                .map_err(PyRuntimeError::new_err)?;
+            }
+            Int64Array::from(out).into_data().to_pyarrow(py)
+        }
+    }
+}
+
+fn parse_dtype(s: &str) -> PyResult<ast_ir::Dtype> {
+    match s {
+        "i64" => Ok(ast_ir::Dtype::I64),
+        "f64" => Ok(ast_ir::Dtype::F64),
+        other => Err(PyValueError::new_err(format!(
+            "unsupported dtype '{}': expected 'i64' or 'f64'",
+            other
+        ))),
+    }
+}
+
 #[pyfunction]
 fn shutdown_workers(py: Python) {
     py.detach(|| {
@@ -479,4 +579,10 @@ mod _gilmap {
 
     #[pymodule_export]
     use super::shutdown_workers;
+
+    #[pymodule_export]
+    use super::jit_compile;
+
+    #[pymodule_export]
+    use super::jit_apply;
 }

@@ -9,10 +9,9 @@ def fake_main_func(x):
 fake_main_func.__module__ = "__main__"
 
 def fake_main_unroutable(x):
-    s = 0
-    for i in range(int(x)):
-        s += i * x
-    return s
+    # Comprehension is outside JIT v2 whitelist — forces subinterp path
+    # where __main__ rejection then fires.
+    return sum(i * x for i in range(int(x) + 1))
 
 def faulty_func(x):
     raise ValueError("Something went terribly wrong")
@@ -50,11 +49,10 @@ def test_local_function_with_routable_body_now_works():
     assert gilmap.map(local_func, [1, 2, 3]) == [2, 4, 6]
 
 def test_local_function_with_unroutable_body_rejected():
+    # Use a comprehension — outside JIT v2 whitelist — so router falls
+    # through to subinterp where the local-fn rejection fires.
     def local_acc(x):
-        acc = 0
-        for i in range(int(x)):
-            acc += i
-        return acc
+        return sum(i * x for i in range(int(x) + 1))
     with pytest.raises(ValueError, match="local"):
         gilmap.map(local_acc, [1, 2, 3])
 

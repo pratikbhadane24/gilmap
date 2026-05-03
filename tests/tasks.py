@@ -44,3 +44,11 @@ def quick_collatz(n: int) -> int:
 def float_math(x: float) -> float:
     return x * 1.5 + 0.5
 
+
+def subinterp_only(x):
+    """Comprehension forces JIT to reject; falls through to sub-interp.
+    Lives in this minimal module so the sub-interp worker can import it
+    without pulling pyarrow (which fails to load in sub-interps on
+    pyarrow 24 + Python 3.14)."""
+    return sum(i * x for i in range(int(x) + 1))
+

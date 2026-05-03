@@ -16,7 +16,7 @@ The router walks detectors in priority order. First match wins.
 |---|---|---|---|
 | 1 | `numba_native` | `func` exposes `nopython_signatures`, `_is_njit`, lives in a `numba.*` module, or has an integer `address` (cfunc) | numpy round-trip + cached numba dispatcher; no CPython per element |
 | 2 | `arrow_kernel` | `func` body is a single `return <expr>` (or lambda body) where `<expr>` is composed of supported binops/unops/`math.*`/comparisons over the input parameter and constants | one or more `pyarrow.compute` calls — whole array in a single C call |
-| 3 | `jit` (skeleton) | wider AST whitelist (loops, locals, conditionals over numerics) — **not yet implemented** | will lower to Cranelift IR with `std::simd` lanes |
+| 3 | `jit` | single-`return <expr>` body of binops/unops/compare/ternary/`math.*` calls — same shape as `arrow_kernel` but compiled to native via Cranelift. Activates when arrow_kernel rejects (e.g. `%` on int lane) | per-element loop in JITed native code |
 | 4 | `subinterp` | nothing else matches | per-worker Python sub-interpreter pool (the original gilmap engine, with all P1 Tier-1+Tier-2 fixes) |
 
 ## What each backend assumes
@@ -41,13 +41,27 @@ The router walks detectors in priority order. First match wins.
   `divide` on int inputs) inherently return float — we preserve the kernel
   dtype rather than lossy-cast.
 
-### `jit` (skeleton)
-Reserved for the Cranelift JIT path. `_detect_jit` always returns None
-today. When implemented:
-- Whitelist will widen to counted loops, local assignments, and
-  conditionals.
-- Compile path: Python AST → typed IR (Rust struct) → Cranelift IR →
-  native function called from worker chunks with SIMD lanes.
+### `jit`
+- v1 whitelist (shared with `arrow_kernel`): single `return <expr>` body
+  composed of `Constant`, `Name(load)`, `BinOp` (incl. `%`, `//`, `**`),
+  `UnaryOp`, `Compare`, `IfExpr`, and `Call` for `math.{sqrt,abs,exp,log,
+  sin,cos,tan,floor,ceil}`.
+- Compile path: Python AST → typed IR (`src/ast_ir.rs`) → JSON →
+  Cranelift IR → native `extern "C" fn(*const T, *mut T, len)` →
+  `_gilmap.jit_apply`.
+- Stable kernel hash from the IR JSON; recompiled only on cache miss.
+- Current routing: arrow_kernel runs first (its pyarrow.compute kernels
+  are hand-tuned SIMD and beat scalar-loop native code on the trivially
+  vectorizable shapes both backends share). JIT v1 actually fires for
+  shapes arrow_kernel rejects — most notably integer `%`, which matches
+  `quick_collatz`-style ternaries: `n // 2 if n % 2 == 0 else 3 * n + 1`.
+- v1 limitations (P5b will lift): no local assigns, no counted for-loops,
+  no if-statements with early return. That set is what `mandelbrot_iters`
+  needs; until P5b lands it stays on `subinterp`.
+- Cranelift-specific quirks: integer `%` uses `srem` (C-style signed
+  remainder), which differs from Python's `%` for negative inputs. Don't
+  route negative-input `%` through JIT until we add a Python-semantics
+  helper (`x - floordiv(x, y) * y`).
 
 ### `subinterp`
 - The function must be importable from a sub-interpreter — i.e.
@@ -76,7 +90,13 @@ gilmap.explain(kernel)
 gilmap.explain(lambda x: math.sqrt(x) * 2.0)
 # {'backend': 'arrow_kernel', ..., 'has_fast_path': True}
 
-# subinterp (multi-statement body)
+# jit (% rejected by arrow_kernel; JIT compiles to native srem)
+def collatz_step(n):
+    return n // 2 if n % 2 == 0 else 3 * n + 1
+gilmap.explain(collatz_step)
+# {'backend': 'jit', ..., 'has_fast_path': True}
+
+# subinterp (multi-statement body — needs P5b)
 def heavy(x):
     s = 0
     for i in range(x):

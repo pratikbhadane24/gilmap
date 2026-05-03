@@ -101,8 +101,12 @@ Both paths produce a `pyarrow.Array` and skip the Rust worker pool.
 |---|---|
 | `gilmap/__init__.py` | public API + dispatch |
 | `gilmap/_router.py` | backend detectors + decision cache |
-| `src/lib.rs` | sub-interpreter worker pool, interned cache, adaptive chunking |
+| `gilmap/_jit.py` | Python-side AST → JSON IR walker for the JIT path |
+| `src/lib.rs` | sub-interpreter worker pool, interned cache, adaptive chunking, JIT PyO3 bindings |
+| `src/ast_ir.rs` | typed IR shared between `_jit.py` and Cranelift codegen |
+| `src/jit.rs` | Cranelift JIT module + per-kernel registry |
 | `tests/test_router.py` | router selection + fast-path correctness |
+| `tests/test_jit.py` | JIT correctness vs Python parity |
 | `tests/test_numba_bridge.py` | `numba_native` dispatch round-trip |
 | `tests/test_free_threaded.py` | `Py_GIL_DISABLED` gating |
 | `tests/test_safety.py` | sub-interp guard rails |
@@ -111,15 +115,42 @@ Both paths produce a `pyarrow.Array` and skip the Rust worker pool.
 | `docs/BACKENDS.md` | per-backend contract |
 | `docs/BENCHMARKS.md` | generated benchmark report |
 
+## Cranelift JIT (P5a — shipped)
+
+`src/jit.rs` + `src/ast_ir.rs` host the Cranelift codegen. Pipeline:
+
+```
+gilmap/_jit.py    Python AST  →  walked into typed dict  →  json.dumps
+                                                                    │
+                                                                    ▼
+src/lib.rs        jit_compile(json)  →  serde_json::from_str  →  Kernel
+                                                                    │
+                                                                    ▼
+src/jit.rs        compile()  →  Cranelift IR with inner i in 0..len loop
+                  → JITModule.finalize  →  raw fn pointer cached by hash
+                                                                    │
+                                                                    ▼
+src/lib.rs        jit_apply(hash, dtype, arr)  →  invoke_kernel
+                  →  unsafe transmute to extern "C" fn(*const T, *mut T, usize)
+                  →  return Float64Array / Int64Array
+```
+
+v1 covers single `return <expr>`. P5b extends the IR (`Assign`, `For`,
+`IfStmt`, `Locals`) and the Cranelift codegen to handle multi-statement
+bodies — the missing piece for `mandelbrot_iters` and friends.
+
 ## Future moves
 
-These are designed-in but not yet wired:
+- **P5b — JIT for multi-statement bodies**: extend `Expr` enum with
+  `Block`, `Assign`, `For(range)`, `IfElse(early_return)`. Codegen
+  builds basic blocks for control flow. Closes the `mandelbrot_iters`
+  loss (currently 13× behind numba).
 - **Move B** (free-threaded primary): rayon thread pool sharing the main
   interpreter when `Py_GIL_DISABLED=1`. Today the router still picks the
   fast paths on free-threaded builds; only the sub-interp fallback raises.
-- **Move D** (Cranelift JIT): widen the routable AST whitelist beyond
-  Arrow kernels. `_router._detect_jit` is a placeholder that always
-  returns None.
 - **Move C extension** (numba native pointer): pull `func.address` from
   `@cfunc` and call the raw `extern "C"` pointer from Rust to skip the
   numpy round-trip entirely.
+- **SIMD lanes inside JIT loops**: today the JITed body processes one
+  scalar per iteration. Vectorize with `std::simd<f64; 8>` /
+  `std::simd<i64; 4>` for measurable wins on the f64 lane.

@@ -170,20 +170,20 @@ loses" section). The block between the markers is overwritten by
 `python -m benchmarks.report <results.json>`; do not hand-edit it.
 
 <!-- BENCH:START -->
-On `float_math` at N=1,000,000, **gilmap** (gilmap_arrow@arrow) is **69.14× faster** than the best non-gilmap runner (`numba`) — measured on Apple M3 Max.
+On `float_math` at N=1,000,000, **gilmap** (gilmap_arrow@arrow) is **77.58× faster** than the best non-gilmap runner (`numba`) — measured on Apple M3 Max.
 
 **Summary across 6 workloads:**
 
 | workload | best gilmap variant | speedup vs runner-up | runner-up |
 |---|---|---|---|
-| float_math N=1,000,000 | gilmap_arrow@arrow | 69.14× | numba |
-| float_math N=100,000 | gilmap_arrow@arrow | 63.25× | numba |
-| float_math N=10,000 | gilmap_arrow@arrow | 19.80× | numpy_vec |
-| quick_collatz N=1,000,000 | gilmap_arrow@arrow | 5.90× | numba |
-| quick_collatz N=100,000 | gilmap_arrow@arrow | 4.24× | numba |
-| ⚠ mandelbrot_iters N=25,000 | gilmap_arrow@arrow | 0.07× (we lose) | numba |
-| ⚠ mandelbrot_iters N=1,000 | gilmap_arrow@arrow | 0.08× (we lose) | numba |
-| ⚠ mandelbrot_iters N=10,000 | gilmap_arrow@arrow | 0.14× (we lose) | numba |
+| float_math N=1,000,000 | gilmap_arrow@arrow | 77.58× | numba |
+| float_math N=100,000 | gilmap_arrow@arrow | 63.70× | numba |
+| quick_collatz N=1,000,000 | gilmap_arrow@arrow | 52.02× | numba |
+| quick_collatz N=100,000 | gilmap_arrow@arrow | 44.65× | numba |
+| quick_collatz N=10,000 | gilmap_arrow@arrow | 21.57× | numpy_vec |
+| ⚠ mandelbrot_iters N=1,000 | gilmap_arrow@arrow | 0.22× (we lose) | numba |
+| ⚠ count_primes N=512 | gilmap_arrow@arrow | 0.89× (we lose) | joblib |
+| ⚠ heavy_collatz N=64 | gilmap_arrow@arrow | 0.95× (we lose) | cf_process |
 
 ⚠ rows are workloads where gilmap loses to a faster runner — included so this table is honest, not cherry-picked. Full breakdown in `docs/BENCHMARKS.md`.
 

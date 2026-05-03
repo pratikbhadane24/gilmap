@@ -319,13 +319,45 @@ def _detect_arrow_kernel(func: Callable) -> BackendDecision | None:
 # Detection: Cranelift JIT (skeleton)
 # ----------------------------------------------------------------------
 
-def _detect_jit(_func: Callable) -> BackendDecision | None:
-    """Cranelift JIT path. Skeleton: not yet wired to Rust.
+def _detect_jit(func: Callable) -> BackendDecision | None:
+    """Cranelift JIT. v2 (P5b) handles multi-statement bodies with local
+    assigns, counted `for i in range(N)` loops, and `if cond: return X`
+    early returns. v1 (P5a) single-expression bodies still work via the
+    same code path — the walker emits a single-`return` body for those.
 
-    When implemented, this detects a wider AST whitelist (loops, locals,
-    conditionals over numerics) and lowers to Cranelift IR with std::simd.
-    For now we always return None; the router falls through to subinterp.
+    Order in the detector chain: runs *after* arrow_kernel. arrow_kernel's
+    pyarrow.compute kernels beat per-element native code for the simple
+    vectorizable shapes both backends support, so JIT only fires for
+    shapes arrow_kernel rejects (loops, locals, early-return, integer `%`).
     """
+    from . import _jit
+
+    # Probe both input dtype lanes so we cache one decision per (func,
+    # input_dtype). Try f64 first since most non-trivial kernels use it.
+    for in_dtype in ("f64", "i64"):
+        compiled = _jit.try_compile(func, in_dtype)
+        if compiled is None:
+            continue
+        kernel_hash, out_dtype = compiled
+
+        def fast(
+            _f: Callable,
+            arr: pa.Array,
+            _h: int = kernel_hash,
+            _in: str = in_dtype,
+            _out: str = out_dtype,
+        ) -> pa.Array:
+            if _in == "f64" and not pa.types.is_float64(arr.type):
+                arr = arr.cast(pa.float64())
+            elif _in == "i64" and not pa.types.is_int64(arr.type):
+                arr = arr.cast(pa.int64())
+            return _jit.jit_apply(_h, _in, _out, arr)
+
+        return BackendDecision(
+            backend="jit",
+            reason=f"native via Cranelift (in={in_dtype}, out={out_dtype})",
+            fast_path=fast,
+        )
     return None
 
 
