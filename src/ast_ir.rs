@@ -115,3 +115,62 @@ pub struct Kernel {
     /// of statements (v2). Always serialized as a list.
     pub body: Vec<Stmt>,
 }
+
+impl Kernel {
+    /// True if this kernel can be lowered into a SIMD vector main loop +
+    /// scalar tail (Phase 1 SIMD shape).
+    ///
+    /// Requirements:
+    /// - Body is a single `Stmt::Return`.
+    /// - Returned expression has no per-lane divergence:
+    ///   - no `Local` references (Phase 1 disables locals to avoid
+    ///     plumbing per-lane SSA bookkeeping);
+    ///   - no `MathCall` (libm has no SIMD-vectorized variant in
+    ///     Cranelift's current symbol table — vectorizing it would
+    ///     require lane-extract + scalar call + lane-insert, which is
+    ///     slower than the scalar codegen path).
+    ///
+    /// Anything else (loops, if-statements, locals, math calls) is
+    /// emitted by the existing scalar codegen — no regression risk.
+    pub fn is_vectorizable_phase1(&self) -> bool {
+        if self.body.len() != 1 {
+            return false;
+        }
+        let Stmt::Return { value } = &self.body[0] else {
+            return false;
+        };
+        is_pure_simd_expr(value)
+    }
+}
+
+fn is_pure_simd_expr(e: &Expr) -> bool {
+    match e {
+        Expr::Param
+        | Expr::ConstI64 { .. }
+        | Expr::ConstF64 { .. }
+        | Expr::ConstBool { .. } => true,
+        Expr::Local { .. } | Expr::MathCall { .. } => false,
+        Expr::Unary { operand, .. } => is_pure_simd_expr(operand),
+        Expr::BinOp { op, left, right } => {
+            // Cranelift's vector backends don't lane-lower these:
+            //   - Mod (`srem`): scalar-int only
+            //   - FloorDiv: lowered through srem on i64, fmod on f64 (libm)
+            //   - Div on i64 (`sdiv`): scalar-int only
+            //   - Pow: libm scalar-only
+            // f64 Div (`fdiv`) IS vector-friendly but distinguishing
+            // op-dtype here would need full type inference; keep the
+            // predicate conservative — these cases stay on scalar.
+            if matches!(op, BinOp::Mod | BinOp::FloorDiv | BinOp::Div | BinOp::Pow) {
+                return false;
+            }
+            is_pure_simd_expr(left) && is_pure_simd_expr(right)
+        }
+        Expr::Compare { left, right, .. } => {
+            is_pure_simd_expr(left) && is_pure_simd_expr(right)
+        }
+        Expr::IfExpr { test, yes, no } => {
+            is_pure_simd_expr(test) && is_pure_simd_expr(yes) && is_pure_simd_expr(no)
+        }
+        Expr::CastToI64 { value } | Expr::CastToF64 { value } => is_pure_simd_expr(value),
+    }
+}

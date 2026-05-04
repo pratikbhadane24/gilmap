@@ -1,12 +1,11 @@
 """Free-threaded build (PEP 703 / cp313t / cp314t) gating.
 
-These tests guard the contract that:
-  - On a GIL-enabled build, gilmap loads normally and the sub-interp path is
-    available.
-  - On a free-threaded build, gilmap still loads (we stopped raising at
-    import in the P1+ rewrite); router fast paths still work; the
-    sub-interpreter fallback raises a targeted RuntimeError so callers know
-    to rewrite for an Arrow-kernel / numba shape.
+Contract:
+  - On a GIL-enabled build, gilmap loads normally and the sub-interpreter
+    fallback is available.
+  - On a free-threaded build, gilmap loads, fast paths still work, and the
+    fallback path runs on a rayon-based executor that shares the main
+    interpreter — no longer raises.
 """
 
 import sysconfig
@@ -45,14 +44,37 @@ def test_subinterp_path_works_on_gil_build():
 
 
 @pytest.mark.skipif(not _FREE_THREADED, reason="only meaningful on free-threaded build")
-def test_subinterp_fallback_raises_clear_error_on_free_threaded():
-    """On a 3.13t/3.14t build, hitting the sub-interp path must produce a
-    clear, actionable error pointing the user at the router's fast paths.
+def test_rayon_fallback_runs_on_free_threaded():
+    """On a 3.13t/3.14t build, the fallback path must execute on the
+    rayon-based shared-interpreter executor and produce correct results.
     """
     import os
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
     from tasks import slow_square  # body has a for-loop, not router-routable
 
-    with pytest.raises(RuntimeError, match="free-threaded"):
-        gilmap.map(slow_square, list(range(5)))
+    out = gilmap.map(slow_square, list(range(5)))
+    assert out == [x * x for x in range(5)]
+
+
+@pytest.mark.skipif(not _FREE_THREADED, reason="only meaningful on free-threaded build")
+def test_rayon_fallback_handles_floats():
+    """f64 path of the rayon executor."""
+    import os
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+    from tasks import float_math
+
+    out = gilmap.map(float_math, [0.0, 1.0, 2.0, 3.0])
+    assert out == [float_math(x) for x in [0.0, 1.0, 2.0, 3.0]]
+
+
+@pytest.mark.skipif(not _FREE_THREADED, reason="only meaningful on free-threaded build")
+def test_rayon_fallback_handles_empty_input():
+    """Empty input is a no-op, not an error, on the rayon executor."""
+    import os
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+    from tasks import slow_square
+
+    assert gilmap.map(slow_square, []) == []

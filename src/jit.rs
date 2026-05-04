@@ -62,7 +62,25 @@ fn cl_type(dtype: Dtype) -> Type {
     }
 }
 
-fn compile(kernel: &Kernel) -> Result<Compiled, String> {
+/// 128-bit SIMD lane type for Phase 1 vectorized JIT codegen.
+/// Both i64 and f64 use 2 lanes to keep input/output lane counts matched
+/// (so an i64-output kernel from f64 input still vectorizes cleanly).
+/// 128-bit is the universally legalized vector width across Cranelift's
+/// x86_64 (SSE2+) and aarch64 (NEON) backends — wider lanes (X4/X8) are
+/// a separate follow-up gated on ISA feature detection.
+const SIMD_LANES: u32 = 2;
+
+fn cl_vec_type(dtype: Dtype) -> Type {
+    match dtype {
+        Dtype::I64 => types::I64X2,
+        Dtype::F64 => types::F64X2,
+    }
+}
+
+/// Build a JIT module with all the boilerplate: ISA flags, libm symbols,
+/// the standard `extern "C" fn(*const u8, *mut u8, usize)` signature.
+/// Both the scalar and SIMD compile paths start from this.
+fn setup_jit_module() -> Result<(JITModule, Type, Signature), String> {
     let mut flag_builder = settings::builder();
     flag_builder
         .set("opt_level", "speed")
@@ -79,16 +97,28 @@ fn compile(kernel: &Kernel) -> Result<Compiled, String> {
     let mut jit_builder =
         JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     register_libm_symbols(&mut jit_builder);
-    let mut module = JITModule::new(jit_builder);
-
+    let module = JITModule::new(jit_builder);
     let pointer_ty = module.target_config().pointer_type();
-    let in_ty = cl_type(kernel.input_dtype);
-    let out_ty = cl_type(kernel.output_dtype);
 
     let mut sig = Signature::new(module.target_config().default_call_conv);
     sig.params.push(AbiParam::new(pointer_ty));
     sig.params.push(AbiParam::new(pointer_ty));
     sig.params.push(AbiParam::new(pointer_ty));
+
+    Ok((module, pointer_ty, sig))
+}
+
+fn compile(kernel: &Kernel) -> Result<Compiled, String> {
+    if kernel.is_vectorizable_phase1() {
+        return compile_simd(kernel);
+    }
+    compile_scalar(kernel)
+}
+
+fn compile_scalar(kernel: &Kernel) -> Result<Compiled, String> {
+    let (mut module, pointer_ty, sig) = setup_jit_module()?;
+    let in_ty = cl_type(kernel.input_dtype);
+    let out_ty = cl_type(kernel.output_dtype);
 
     let func_id = module
         .declare_function("gilmap_kernel", Linkage::Export, &sig)
@@ -206,6 +236,328 @@ fn compile(kernel: &Kernel) -> Result<Compiled, String> {
         fn_ptr,
         _module: module,
     })
+}
+
+/// SIMD codegen path. Emits two loops over the buffer:
+/// 1. Vector main loop: process `SIMD_LANES` elements per iteration via
+///    Cranelift vector-typed loads/ops/stores. Cranelift legalizes
+///    128-bit operations to native SSE2/NEON instructions on the host.
+/// 2. Scalar tail: handle the trailing `len % SIMD_LANES` elements with
+///    the same per-element codegen the scalar path uses (via `Lowerer`).
+///
+/// The scalar tail reuses `Lowerer` rather than inlining a third copy of
+/// expression lowering — that way bug-fixes in the scalar path
+/// automatically apply here.
+fn compile_simd(kernel: &Kernel) -> Result<Compiled, String> {
+    // Predicate guarantees body is `[Stmt::Return(expr)]`.
+    let Stmt::Return { value: return_expr } = &kernel.body[0] else {
+        unreachable!("compile_simd called on non-vectorizable kernel");
+    };
+
+    let (mut module, pointer_ty, sig) = setup_jit_module()?;
+    let in_ty = cl_type(kernel.input_dtype);
+    let out_ty = cl_type(kernel.output_dtype);
+    let in_vec_ty = cl_vec_type(kernel.input_dtype);
+
+    let func_id = module
+        .declare_function("gilmap_kernel", Linkage::Export, &sig)
+        .map_err(|e| e.to_string())?;
+
+    let mut ctx = module.make_context();
+    ctx.func = Function::with_name_signature(
+        cranelift_codegen::ir::UserFuncName::user(0, 0),
+        sig,
+    );
+
+    let mut fb_ctx = FunctionBuilderContext::new();
+    {
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+
+        let entry = builder.create_block();
+        let vec_header = builder.create_block();
+        let vec_body = builder.create_block();
+        let scalar_header = builder.create_block();
+        let scalar_entry = builder.create_block();
+        let scalar_exit = builder.create_block();
+        let outer_exit = builder.create_block();
+
+        builder.append_block_params_for_function_params(entry);
+        let in_ptr = builder.block_params(entry)[0];
+        let out_ptr = builder.block_params(entry)[1];
+        let len = builder.block_params(entry)[2];
+
+        let i_var = builder.declare_var(pointer_ty);
+        let tail_result_var = builder.declare_var(out_ty);
+
+        builder.switch_to_block(entry);
+        let zero = builder.ins().iconst(pointer_ty, 0);
+        builder.def_var(i_var, zero);
+        let lanes_const = builder.ins().iconst(pointer_ty, SIMD_LANES as i64);
+        // vec_end = len - (len % LANES); cheaper than (len / LANES) * LANES
+        // because cranelift can't const-fold the divide on a runtime `len`.
+        let len_mod = builder.ins().urem(len, lanes_const);
+        let vec_end = builder.ins().isub(len, len_mod);
+        let elem_size_in = builder.ins().iconst(pointer_ty, in_ty.bytes() as i64);
+        let elem_size_out = builder.ins().iconst(pointer_ty, out_ty.bytes() as i64);
+        let one = builder.ins().iconst(pointer_ty, 1);
+        let mem = MemFlags::new();
+        builder.ins().jump(vec_header, &[]);
+
+        builder.switch_to_block(vec_header);
+        let i_now = builder.use_var(i_var);
+        let vec_cond = builder.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThan,
+            i_now,
+            vec_end,
+        );
+        builder
+            .ins()
+            .brif(vec_cond, vec_body, &[], scalar_header, &[]);
+
+        builder.switch_to_block(vec_body);
+        let i_now2 = builder.use_var(i_var);
+        let off_in = builder.ins().imul(i_now2, elem_size_in);
+        let in_addr = builder.ins().iadd(in_ptr, off_in);
+        let vec_val = builder.ins().load(in_vec_ty, mem, in_addr, 0);
+
+        let mut simd = SimdLowerer {
+            builder: &mut builder,
+            input_dtype: kernel.input_dtype,
+            param: vec_val,
+        };
+        let vec_result = simd.lower(return_expr, kernel.output_dtype)?;
+
+        let i_now3 = builder.use_var(i_var);
+        let off_out = builder.ins().imul(i_now3, elem_size_out);
+        let out_addr = builder.ins().iadd(out_ptr, off_out);
+        builder.ins().store(mem, vec_result, out_addr, 0);
+
+        let i_next_vec = builder.ins().iadd(i_now3, lanes_const);
+        builder.def_var(i_var, i_next_vec);
+        builder.ins().jump(vec_header, &[]);
+
+        builder.switch_to_block(scalar_header);
+        let i_tail = builder.use_var(i_var);
+        let tail_cond = builder.ins().icmp(
+            cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThan,
+            i_tail,
+            len,
+        );
+        builder
+            .ins()
+            .brif(tail_cond, scalar_entry, &[], outer_exit, &[]);
+
+        builder.switch_to_block(scalar_entry);
+        let i_s = builder.use_var(i_var);
+        let off_in_s = builder.ins().imul(i_s, elem_size_in);
+        let in_addr_s = builder.ins().iadd(in_ptr, off_in_s);
+        let val_s = builder.ins().load(in_ty, mem, in_addr_s, 0);
+
+        let mut lowerer = Lowerer {
+            builder: &mut builder,
+            module: &mut module,
+            input_dtype: kernel.input_dtype,
+            output_dtype: kernel.output_dtype,
+            param: val_s,
+            locals: HashMap::new(),
+            result_var: tail_result_var,
+            elem_exit: scalar_exit,
+            terminated: false,
+            loops: Vec::new(),
+        };
+        lowerer.lower_body(&kernel.body)?;
+        debug_assert!(
+            lowerer.terminated,
+            "Phase 1 vectorizable bodies always terminate via Return"
+        );
+
+        builder.switch_to_block(scalar_exit);
+        let result_val = builder.use_var(tail_result_var);
+        let i_s2 = builder.use_var(i_var);
+        let off_out_s = builder.ins().imul(i_s2, elem_size_out);
+        let out_addr_s = builder.ins().iadd(out_ptr, off_out_s);
+        builder.ins().store(mem, result_val, out_addr_s, 0);
+        let i_next_s = builder.ins().iadd(i_s2, one);
+        builder.def_var(i_var, i_next_s);
+        builder.ins().jump(scalar_header, &[]);
+
+        builder.switch_to_block(outer_exit);
+        builder.ins().return_(&[]);
+
+        builder.seal_all_blocks();
+        builder.finalize();
+    }
+
+    module
+        .define_function(func_id, &mut ctx)
+        .map_err(|e| format!("define_function: {:?}", e))?;
+    module.clear_context(&mut ctx);
+    module
+        .finalize_definitions()
+        .map_err(|e| format!("finalize: {:?}", e))?;
+
+    let fn_ptr = module.get_finalized_function(func_id) as usize;
+    Ok(Compiled {
+        fn_ptr,
+        _module: module,
+    })
+}
+
+/// Vector-typed analogue of `Lowerer` for the SIMD main loop. Phase 1 only
+/// — pure expressions, no locals, no MathCall (see
+/// `Kernel::is_vectorizable_phase1`).
+struct SimdLowerer<'a, 'b> {
+    builder: &'a mut FunctionBuilder<'b>,
+    input_dtype: Dtype,
+    param: Value,
+}
+
+impl<'a, 'b> SimdLowerer<'a, 'b> {
+    fn lower(&mut self, expr: &Expr, expected: Dtype) -> Result<Value, String> {
+        Ok(match expr {
+            Expr::Param => self.coerce(self.param, self.input_dtype, expected),
+            Expr::ConstI64 { value } => {
+                let s = self.builder.ins().iconst(types::I64, *value);
+                let v = self.builder.ins().splat(types::I64X2, s);
+                self.coerce(v, Dtype::I64, expected)
+            }
+            Expr::ConstF64 { value } => {
+                let s = self.builder.ins().f64const(*value);
+                let v = self.builder.ins().splat(types::F64X2, s);
+                self.coerce(v, Dtype::F64, expected)
+            }
+            Expr::ConstBool { value } => {
+                // All-ones / all-zeros mask shape required by bitselect.
+                let s = self.builder.ins().iconst(types::I64, if *value { -1 } else { 0 });
+                self.builder.ins().splat(types::I64X2, s)
+            }
+            Expr::Unary { op, operand } => {
+                let v = self.lower(operand, expected)?;
+                match (op, expected) {
+                    (UnaryOp::Neg, Dtype::I64) => self.builder.ins().ineg(v),
+                    (UnaryOp::Neg, Dtype::F64) => self.builder.ins().fneg(v),
+                    (UnaryOp::Plus, _) => v,
+                }
+            }
+            Expr::BinOp { op, left, right } => {
+                let l = self.lower(left, expected)?;
+                let r = self.lower(right, expected)?;
+                match (op, expected) {
+                    (BinOp::Add, Dtype::I64) => self.builder.ins().iadd(l, r),
+                    (BinOp::Sub, Dtype::I64) => self.builder.ins().isub(l, r),
+                    (BinOp::Mul, Dtype::I64) => self.builder.ins().imul(l, r),
+                    (BinOp::Div, Dtype::I64) | (BinOp::FloorDiv, Dtype::I64) => {
+                        self.builder.ins().sdiv(l, r)
+                    }
+                    (BinOp::Mod, Dtype::I64) => self.builder.ins().srem(l, r),
+                    (BinOp::Pow, Dtype::I64) => {
+                        return Err("integer pow not supported in SIMD JIT".into());
+                    }
+                    (BinOp::Add, Dtype::F64) => self.builder.ins().fadd(l, r),
+                    (BinOp::Sub, Dtype::F64) => self.builder.ins().fsub(l, r),
+                    (BinOp::Mul, Dtype::F64) => self.builder.ins().fmul(l, r),
+                    (BinOp::Div, Dtype::F64) => self.builder.ins().fdiv(l, r),
+                    (BinOp::FloorDiv, Dtype::F64) | (BinOp::Mod, Dtype::F64) => {
+                        return Err("floor/mod on f64 not supported in SIMD JIT".into());
+                    }
+                    (BinOp::Pow, Dtype::F64) => {
+                        return Err(
+                            "f64 pow uses libm; not supported in SIMD path".into(),
+                        );
+                    }
+                }
+            }
+            Expr::Compare { op, left, right } => {
+                let cmp_dtype = guess_simd_cmp_dtype(left, right, self.input_dtype);
+                let l = self.lower(left, cmp_dtype)?;
+                let r = self.lower(right, cmp_dtype)?;
+                match cmp_dtype {
+                    Dtype::I64 => {
+                        use cranelift_codegen::ir::condcodes::IntCC::*;
+                        let cc = match op {
+                            CmpOp::Lt => SignedLessThan,
+                            CmpOp::Le => SignedLessThanOrEqual,
+                            CmpOp::Gt => SignedGreaterThan,
+                            CmpOp::Ge => SignedGreaterThanOrEqual,
+                            CmpOp::Eq => Equal,
+                            CmpOp::Ne => NotEqual,
+                        };
+                        self.builder.ins().icmp(cc, l, r)
+                    }
+                    Dtype::F64 => {
+                        use cranelift_codegen::ir::condcodes::FloatCC::*;
+                        let cc = match op {
+                            CmpOp::Lt => LessThan,
+                            CmpOp::Le => LessThanOrEqual,
+                            CmpOp::Gt => GreaterThan,
+                            CmpOp::Ge => GreaterThanOrEqual,
+                            CmpOp::Eq => Equal,
+                            CmpOp::Ne => NotEqual,
+                        };
+                        self.builder.ins().fcmp(cc, l, r)
+                    }
+                }
+            }
+            Expr::IfExpr { test, yes, no } => {
+                // bitselect requires all three operands the same type;
+                // icmp/fcmp on vectors return an int mask, so reinterpret
+                // the i64x2 mask bits as f64x2 when the operands are f64.
+                let cond_raw = self.lower(test, Dtype::I64)?;
+                let yes_v = self.lower(yes, expected)?;
+                let no_v = self.lower(no, expected)?;
+                let cond_for_select = match expected {
+                    Dtype::I64 => cond_raw,
+                    Dtype::F64 => self.builder.ins().bitcast(
+                        types::F64X2,
+                        MemFlags::new(),
+                        cond_raw,
+                    ),
+                };
+                self.builder.ins().bitselect(cond_for_select, yes_v, no_v)
+            }
+            Expr::CastToI64 { value } => {
+                let v = self.lower(value, Dtype::F64)?;
+                self.builder.ins().fcvt_to_sint(types::I64X2, v)
+            }
+            Expr::CastToF64 { value } => {
+                let v = self.lower(value, Dtype::I64)?;
+                self.builder.ins().fcvt_from_sint(types::F64X2, v)
+            }
+            Expr::Local { .. } | Expr::MathCall { .. } => {
+                unreachable!("predicate rejects Local / MathCall before SIMD lowering")
+            }
+        })
+    }
+
+    fn coerce(&mut self, v: Value, actual: Dtype, expected: Dtype) -> Value {
+        match (actual, expected) {
+            (Dtype::I64, Dtype::I64) | (Dtype::F64, Dtype::F64) => v,
+            (Dtype::I64, Dtype::F64) => self.builder.ins().fcvt_from_sint(types::F64X2, v),
+            (Dtype::F64, Dtype::I64) => self.builder.ins().fcvt_to_sint(types::I64X2, v),
+        }
+    }
+}
+
+fn guess_simd_cmp_dtype(left: &Expr, right: &Expr, input_dtype: Dtype) -> Dtype {
+    fn inspect(e: &Expr, input_dtype: Dtype) -> Option<Dtype> {
+        match e {
+            Expr::ConstF64 { .. } | Expr::CastToF64 { .. } => Some(Dtype::F64),
+            Expr::ConstI64 { .. } | Expr::CastToI64 { .. } => Some(Dtype::I64),
+            Expr::Param => Some(input_dtype),
+            Expr::BinOp { left, right, .. } | Expr::Compare { left, right, .. } => {
+                inspect(left, input_dtype).or_else(|| inspect(right, input_dtype))
+            }
+            Expr::Unary { operand, .. } => inspect(operand, input_dtype),
+            Expr::IfExpr { yes, no, .. } => {
+                inspect(yes, input_dtype).or_else(|| inspect(no, input_dtype))
+            }
+            Expr::ConstBool { .. } => Some(Dtype::I64),
+            Expr::Local { .. } | Expr::MathCall { .. } => None,
+        }
+    }
+    inspect(left, input_dtype)
+        .or_else(|| inspect(right, input_dtype))
+        .unwrap_or(Dtype::I64)
 }
 
 /// Per-loop context for `break`/`continue` targeting. `header_block` is
@@ -679,10 +1031,7 @@ pub unsafe fn invoke_kernel_parallel(
 
     let in_size = dtype_size(in_dtype);
     let out_size = dtype_size(out_dtype);
-    // 4× chunks per worker so fast workers steal from busy ones via
-    // rayon's work-stealing queue.
-    let target_chunks = (num_threads * 4).min(len);
-    let chunk_size = len.div_ceil(target_chunks).max(1);
+    let chunk_size = crate::pick_chunk_size(len, num_threads);
 
     let in_addr = in_ptr as usize;
     let out_addr = out_ptr as usize;

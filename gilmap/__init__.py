@@ -21,18 +21,15 @@ import sysconfig
 
 import pyarrow as pa
 
-from _gilmap import execute, shutdown_workers
+from _gilmap import execute, execute_rayon, shutdown_workers
 
 from . import _router
 
-# Free-threaded (PEP 703) builds: gilmap's sub-interpreter pool relies on
-# Py_NewInterpreterFromConfig with PyInterpreterConfig_OWN_GIL, which is not
-# meaningful when the GIL is disabled globally. We don't refuse to load
-# anymore — instead, the router still picks the fast paths (numba native,
-# Arrow kernels, JIT) which work fine on free-threaded builds. The
-# sub-interpreter fallback is gated; if it's needed on a free-threaded build
-# we raise a targeted error at dispatch time.
+# Free-threaded (PEP 703) builds use a rayon executor sharing the main
+# interpreter; GIL builds use the PEP 684 sub-interpreter pool. The choice
+# is fixed at import time and can't change for the process lifetime.
 _FREE_THREADED = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+_FALLBACK_BACKEND = execute_rayon if _FREE_THREADED else execute
 
 atexit.register(shutdown_workers)
 
@@ -136,29 +133,16 @@ def map(
 
     arr, return_list = _to_arrow(iterable)
 
-    # Fast paths (numba native, Arrow kernel, JIT) operate on the Arrow array
-    # directly and skip the sub-interpreter pool entirely.
     if decision.fast_path is not None:
         result = decision.fast_path(func, arr)
-        # Backends own their output dtype — JIT may return i64 for an f64
-        # input when the function does `return int(...)`. Don't lossy-cast
-        # back to the input lane.
+        # Backends own their output dtype (JIT may return i64 for an f64
+        # input via `return int(...)`); don't lossy-cast back to input lane.
         if return_list:
             return result.to_pylist()
         return result
 
-    # Sub-interpreter fallback path. Requires importable module-level fn.
-    if _FREE_THREADED:
-        raise RuntimeError(
-            "gilmap.map fell back to the sub-interpreter pool on a free-threaded "
-            "Python build. PEP 684 sub-interpreters with own-GIL are unavailable "
-            "when Py_GIL_DISABLED is set. Either rewrite the function in a form "
-            "the router can lower (Arrow kernel / numba @njit), or run on a "
-            "standard GIL-enabled CPython build."
-        )
-
     module_name, func_name = _validate_for_subinterp(func)
-    result_array = execute(module_name, func_name, arr, sys.path)
+    result_array = _FALLBACK_BACKEND(module_name, func_name, arr, sys.path)
     if result_array is not None:
         if return_list:
             return result_array.to_pylist()

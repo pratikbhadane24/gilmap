@@ -2,9 +2,10 @@
 
 Detection order (fastest first; first match wins):
     1. arrow_kernel — single-expr body of supported numeric ops → pyarrow.compute
-    2. numba_native — `@njit`/`@cfunc` callable → cached numba dispatcher
-    3. jit         — multi-statement numeric body → Cranelift JIT
-    4. subinterp   — fallback: per-worker Python sub-interpreter pool
+    2. numba_cfunc  — `@cfunc(types.<T>(types.<T>))` → extern "C" raw pointer
+    3. numba_native — `@njit` / unreadable-sig `@cfunc` → numpy round-trip
+    4. jit          — multi-statement numeric body → Cranelift JIT
+    5. subinterp    — fallback: per-worker Python sub-interpreter pool
 
 Decisions are cached on a weakref so repeat calls hit O(1).
 
@@ -32,7 +33,8 @@ from . import _ast_utils
 
 @dataclass(frozen=True)
 class BackendDecision:
-    backend: str  # one of: "numba_native", "arrow_kernel", "jit", "subinterp"
+    # one of: "arrow_kernel", "numba_cfunc", "numba_native", "jit", "subinterp"
+    backend: str
     reason: str
     # Optional callable that implements the fast path. None means the caller
     # routes to the default sub-interp executor.
@@ -75,18 +77,70 @@ def _cached_decision(func: Callable) -> BackendDecision | None:
 # Detection: numba / cfunc / ctypes / cffi
 # ----------------------------------------------------------------------
 
+_NUMBA_DTYPE_MAP = {"int64": "i64", "float64": "f64"}
+
+
+def _cast_to_dtype_tag(arr: pa.Array, tag: str) -> pa.Array:
+    """Cast `arr` to the pyarrow type matching gilmap's `"i64"`/`"f64"`
+    tag. No-op when already matching."""
+    if tag == "f64" and not pa.types.is_float64(arr.type):
+        return arr.cast(pa.float64())
+    if tag == "i64" and not pa.types.is_int64(arr.type):
+        return arr.cast(pa.int64())
+    return arr
+
+
+def _read_cfunc_dtype_sig(func: Callable) -> str | None:
+    """Read a `@cfunc`'s declared signature as a gilmap dtype tag.
+
+    Accepts only single-arg same-dtype scalar `i64` or `f64` signatures
+    — those map cleanly to the `extern "C" fn(T) -> T` ABI in
+    `src/cfunc_dispatch.rs`. Returns `None` for any other shape.
+    """
+    sig = getattr(func, "_sig", None)
+    if sig is None:
+        return None
+    args = getattr(sig, "args", None)
+    ret = getattr(sig, "return_type", None)
+    if not args or len(args) != 1 or ret is None:
+        return None
+    in_d = _NUMBA_DTYPE_MAP.get(str(args[0]))
+    out_d = _NUMBA_DTYPE_MAP.get(str(ret))
+    if in_d is None or in_d != out_d:
+        return None
+    return in_d
+
+
+def _detect_numba_cfunc(func: Callable) -> BackendDecision | None:
+    """Route `@cfunc(types.<T>(types.<T>))` to the raw-pointer dispatcher
+    in Rust. Falls through to `_detect_numba` for any cfunc with a
+    non-routable signature (mixed-dtype, multi-arg, unreadable).
+    """
+    addr = getattr(func, "address", None)
+    if not (isinstance(addr, int) and callable(func)):
+        return None
+    dtype = _read_cfunc_dtype_sig(func)
+    if dtype is None:
+        return None
+
+    from _gilmap import cfunc_apply
+
+    def fast(_f: Callable, arr: pa.Array, _addr: int = addr, _d: str = dtype) -> pa.Array:
+        return cfunc_apply(_addr, _d, _cast_to_dtype_tag(arr, _d))
+
+    return BackendDecision(
+        backend="numba_cfunc",
+        reason=f"@cfunc raw extern C pointer ({dtype})",
+        fast_path=fast,
+    )
+
+
 def _detect_numba(func: Callable) -> BackendDecision | None:
-    """Detect numba-decorated callables and route to a vectorized form.
-
-    Strategy: numba `@njit` callables expose `nopython_signatures` and a
-    `get_compile_result` helper. The reliable way to apply them across a
-    pyarrow array is to convert to a numpy view and call func element-wise
-    — numba's dispatcher caches its specialization, so per-call cost stays
-    in the tens of nanoseconds (vs hundreds for plain CPython).
-
-    A future move can pull `func.address` from a `@cfunc` and call the
-    raw extern "C" pointer from Rust; left as TODO for now because the
-    safe fast path (numpy round-trip) is already a big win.
+    """Legacy numba dispatch: `@njit` and `@cfunc`s with non-routable
+    signatures. Calls the dispatcher per element via a numpy round-trip;
+    numba's cached specialization keeps per-call cost at ~10-20ns vs
+    CPython's ~150ns. The raw-pointer path (`_detect_numba_cfunc`) is
+    strictly faster when applicable and runs first.
     """
     is_njit = (
         hasattr(func, "nopython_signatures")
@@ -100,9 +154,6 @@ def _detect_numba(func: Callable) -> BackendDecision | None:
         return None
 
     def fast(f: Callable, arr: pa.Array) -> pa.Array:
-        # Convert to numpy (zero-copy when dtype matches) and call f over
-        # each element. With numba's specialization cached this is ~10-20ns
-        # per element vs CPython's ~150ns per call.
         import numpy as np
 
         np_in = arr.to_numpy(zero_copy_only=False)
@@ -311,11 +362,7 @@ def _detect_jit(func: Callable) -> BackendDecision | None:
             _in: str = in_dtype,
             _out: str = out_dtype,
         ) -> pa.Array:
-            if _in == "f64" and not pa.types.is_float64(arr.type):
-                arr = arr.cast(pa.float64())
-            elif _in == "i64" and not pa.types.is_int64(arr.type):
-                arr = arr.cast(pa.int64())
-            return _jit.jit_apply(_h, _in, _out, arr)
+            return _jit.jit_apply(_h, _in, _out, _cast_to_dtype_tag(arr, _in))
 
         return BackendDecision(
             backend="jit",
@@ -334,6 +381,11 @@ DETECTORS: list[tuple[str, Callable[[Callable], BackendDecision | None]]] = [
     # than numba's per-scalar dispatcher even when the user decorated with
     # @njit. Decorator presence does not imply numba's path is fastest.
     ("arrow_kernel", _detect_arrow_kernel),
+    # numba_cfunc before numba_native: the raw-pointer dispatcher skips the
+    # numpy round-trip and per-element CPython call. Only fires when the
+    # cfunc has a readable same-dtype scalar signature; otherwise the
+    # legacy numba_native path handles it.
+    ("numba_cfunc", _detect_numba_cfunc),
     ("numba_native", _detect_numba),
     ("jit", _detect_jit),
 ]

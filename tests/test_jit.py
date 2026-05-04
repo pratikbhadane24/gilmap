@@ -133,3 +133,125 @@ def test_jit_modulo_int_c_semantics():
     out = _apply(m, "i64", data)
     expected = [x % 7 for x in data]
     assert out == expected
+
+
+# ---------------------------------------------------------------------------
+# SIMD-vectorized JIT (Phase 1: 128-bit lanes, single-Return pure-expr bodies)
+# ---------------------------------------------------------------------------
+
+
+def test_simd_f64_arithmetic():
+    """Pure-expression f64 body → vector main loop (F64X2)."""
+    def fma(x):
+        return x * 2.0 + 1.0
+
+    # 1000 elements: 500 vector iterations, no scalar tail.
+    data = [float(i) for i in range(1000)]
+    out = _apply(fma, "f64", data)
+    expected = [fma(x) for x in data]
+    for a, b in zip(out, expected):
+        assert abs(a - b) < 1e-12
+
+
+def test_simd_i64_arithmetic():
+    """Pure-expression i64 body → vector main loop (I64X2)."""
+    def f(x):
+        return x * 3 - 5
+
+    data = list(range(-50, 51))  # 101 elements: 50 vector pairs + 1 tail
+    out = _apply(f, "i64", data)
+    expected = [f(x) for x in data]
+    assert out == expected
+
+
+def test_simd_scalar_tail_runs():
+    """len % SIMD_LANES != 0 forces the scalar-tail loop. With LANES=2,
+    any odd-length input exercises the tail path."""
+    def f(x):
+        return x + 7
+
+    # 13 elements → 6 vector iterations + 1 scalar tail.
+    data = list(range(13))
+    out = _apply(f, "i64", data)
+    assert out == [x + 7 for x in data]
+
+
+def test_simd_compare_select():
+    """Ternary in vectorizable body lowers to vector mask + bitselect."""
+    def clamp(x):
+        return 0.0 if x < 0.0 else x
+
+    data = [-3.0, -1.5, -0.5, 0.0, 0.5, 1.5, 3.0]  # 7 elements: vec + tail
+    out = _apply(clamp, "f64", data)
+    expected = [clamp(x) for x in data]
+    for a, b in zip(out, expected):
+        assert abs(a - b) < 1e-12
+
+
+def test_simd_unary_neg():
+    def f(x):
+        return -x
+
+    data = [float(i) for i in range(-10, 11)]
+    out = _apply(f, "f64", data)
+    expected = [-x for x in data]
+    for a, b in zip(out, expected):
+        assert abs(a - b) < 1e-12
+
+
+def test_simd_mixed_dtype_body_falls_back_to_scalar_path():
+    """math.sqrt forces non-vectorizable (MathCall in body). The scalar
+    codegen path must still produce correct results — no regression.
+    """
+    def f(x):
+        return math.sqrt(x) * 2.0
+
+    data = [float(i) for i in range(1, 21)]
+    out = _apply(f, "f64", data)
+    expected = [f(x) for x in data]
+    for a, b in zip(out, expected):
+        assert abs(a - b) < 1e-12
+
+
+def test_simd_locals_falls_back_to_scalar_path():
+    """Multi-statement body with a local → scalar codegen path. Same
+    answer as Python."""
+    def f(x):
+        s = x + 1
+        return s * s
+
+    data = list(range(15))
+    out = _apply(f, "i64", data)
+    expected = [(x + 1) * (x + 1) for x in data]
+    assert out == expected
+
+
+def test_simd_loop_body_falls_back_to_scalar_path():
+    """Counted loop in body → scalar codegen path."""
+    def f(x):
+        s = 0
+        for _i in range(5):
+            s += x
+        return s
+
+    data = list(range(10))
+    out = _apply(f, "i64", data)
+    expected = [x * 5 for x in data]
+    assert out == expected
+
+
+def test_simd_empty_input():
+    def f(x):
+        return x + 1
+
+    out = _apply(f, "i64", [])
+    assert out == []
+
+
+def test_simd_single_element_only_tail():
+    """len < SIMD_LANES → all elements go through the scalar tail."""
+    def f(x):
+        return x * 2
+
+    out = _apply(f, "i64", [42])
+    assert out == [84]

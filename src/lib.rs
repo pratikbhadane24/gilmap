@@ -1,5 +1,8 @@
 mod ast_ir;
+mod cfunc_dispatch;
 mod jit;
+mod per_element;
+mod rayon_pool;
 
 use arrow::array::{Array, Float64Array, Int64Array, make_array};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
@@ -72,7 +75,7 @@ static WORKER_POOL: OnceLock<WorkerPool> = OnceLock::new();
 const CHUNKS_PER_WORKER: usize = 4;
 const MAX_CHUNK: usize = 4096;
 
-fn pick_chunk_size(len: usize, num_threads: usize) -> usize {
+pub(crate) fn pick_chunk_size(len: usize, num_threads: usize) -> usize {
     if len == 0 {
         return 1;
     }
@@ -230,34 +233,12 @@ fn init_worker_pool() -> WorkerPool {
                                             let output_slice = std::slice::from_raw_parts_mut(
                                                 output_ptr, task.len,
                                             );
-
-                                            for j in 0..task.len {
-                                                let val = input_slice[j];
-
-                                                let val_obj = PyLong_FromLongLong(
-                                                    val as std::os::raw::c_longlong,
-                                                );
-                                                if val_obj.is_null() {
-                                                    return Err(PyErr::fetch(py_sub));
-                                                }
-
-                                                let res_obj =
-                                                    PyObject_CallOneArg(func_ptr, val_obj);
-                                                Py_DECREF(val_obj);
-
-                                                if res_obj.is_null() {
-                                                    return Err(PyErr::fetch(py_sub));
-                                                }
-
-                                                let res_i64 = PyLong_AsLongLong(res_obj);
-                                                Py_DECREF(res_obj);
-
-                                                if res_i64 == -1 && !PyErr_Occurred().is_null() {
-                                                    return Err(PyErr::fetch(py_sub));
-                                                }
-
-                                                output_slice[j] = res_i64 as i64;
-                                            }
+                                            per_element::call_per_element_i64(
+                                                py_sub,
+                                                func_ptr,
+                                                input_slice,
+                                                output_slice,
+                                            )?;
                                         }
                                         DataType::Float64 {
                                             input_ptr,
@@ -268,34 +249,12 @@ fn init_worker_pool() -> WorkerPool {
                                             let output_slice = std::slice::from_raw_parts_mut(
                                                 output_ptr, task.len,
                                             );
-
-                                            for j in 0..task.len {
-                                                let val = input_slice[j];
-
-                                                let val_obj = PyFloat_FromDouble(
-                                                    val as std::os::raw::c_double,
-                                                );
-                                                if val_obj.is_null() {
-                                                    return Err(PyErr::fetch(py_sub));
-                                                }
-
-                                                let res_obj =
-                                                    PyObject_CallOneArg(func_ptr, val_obj);
-                                                Py_DECREF(val_obj);
-
-                                                if res_obj.is_null() {
-                                                    return Err(PyErr::fetch(py_sub));
-                                                }
-
-                                                let res_f64 = PyFloat_AsDouble(res_obj);
-                                                Py_DECREF(res_obj);
-
-                                                if res_f64 == -1.0 && !PyErr_Occurred().is_null() {
-                                                    return Err(PyErr::fetch(py_sub));
-                                                }
-
-                                                output_slice[j] = res_f64 as f64;
-                                            }
+                                            per_element::call_per_element_f64(
+                                                py_sub,
+                                                func_ptr,
+                                                input_slice,
+                                                output_slice,
+                                            )?;
                                         }
                                     }
                                     Ok(())
@@ -552,6 +511,47 @@ fn parse_dtype(s: &str) -> PyResult<ast_ir::Dtype> {
     }
 }
 
+/// Apply a numba `@cfunc` raw `extern "C" fn(T) -> T` pointer over an
+/// Arrow array, parallel via rayon. `addr` is `func.address`; `dtype` is
+/// `"i64"` or `"f64"` and must match the `@cfunc` declaration.
+#[pyfunction]
+fn cfunc_apply<'py>(
+    py: Python<'py>,
+    addr: usize,
+    dtype: &str,
+    array: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let array_data = arrow::array::ArrayData::from_pyarrow_bound(&array)
+        .map_err(|e| PyValueError::new_err(format!("Failed to parse Arrow array: {}", e)))?;
+    let arrow_array = make_array(array_data);
+    let len = arrow_array.len();
+
+    match parse_dtype(dtype)? {
+        ast_ir::Dtype::F64 => {
+            let float_array = arrow_array
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| {
+                    PyValueError::new_err("cfunc_apply: expected Float64 input array")
+                })?;
+            let input = float_array.values();
+            let mut out = vec![0f64; len];
+            py.detach(|| unsafe { cfunc_dispatch::apply_f64(addr, input, &mut out) });
+            Float64Array::from(out).into_data().to_pyarrow(py)
+        }
+        ast_ir::Dtype::I64 => {
+            let int_array = arrow_array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| PyValueError::new_err("cfunc_apply: expected Int64 input array"))?;
+            let input = int_array.values();
+            let mut out = vec![0i64; len];
+            py.detach(|| unsafe { cfunc_dispatch::apply_i64(addr, input, &mut out) });
+            Int64Array::from(out).into_data().to_pyarrow(py)
+        }
+    }
+}
+
 #[pyfunction]
 fn shutdown_workers(py: Python) {
     py.detach(|| {
@@ -578,6 +578,9 @@ mod _gilmap {
     use super::execute;
 
     #[pymodule_export]
+    use super::rayon_pool::execute_rayon;
+
+    #[pymodule_export]
     use super::shutdown_workers;
 
     #[pymodule_export]
@@ -585,4 +588,7 @@ mod _gilmap {
 
     #[pymodule_export]
     use super::jit_apply;
+
+    #[pymodule_export]
+    use super::cfunc_apply;
 }
