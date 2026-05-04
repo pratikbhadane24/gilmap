@@ -21,7 +21,7 @@ import sysconfig
 
 import pyarrow as pa
 
-from _gilmap import execute, execute_rayon, shutdown_workers
+from ._gilmap import execute, execute_rayon, shutdown_workers
 
 from . import _router
 

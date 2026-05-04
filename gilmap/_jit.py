@@ -15,7 +15,7 @@ import ast
 import json
 from typing import Callable
 
-from _gilmap import jit_apply, jit_compile
+from ._gilmap import jit_apply, jit_compile
 
 from . import _ast_utils
 
