@@ -123,7 +123,7 @@ def _detect_numba_cfunc(func: Callable) -> BackendDecision | None:
     if dtype is None:
         return None
 
-    from _gilmap import cfunc_apply
+    from ._gilmap import cfunc_apply
 
     def fast(_f: Callable, arr: pa.Array, _addr: int = addr, _d: str = dtype) -> pa.Array:
         return cfunc_apply(_addr, _d, _cast_to_dtype_tag(arr, _d))

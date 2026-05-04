@@ -51,7 +51,10 @@ Repository = "https://github.com/pratikbhadane/gilmap"
 Issues = "https://github.com/pratikbhadane/gilmap/issues"
 
 [tool.maturin]
-# Maturin auto-discovers the `gilmap/` Python package next to pyproject.toml.
+# Mixed Python/Rust layout: `gilmap/` is the Python package; the Rust
+# cdylib `_gilmap` is placed inside it as `gilmap._gilmap`.
+module-name = "gilmap._gilmap"
+python-source = "."
 # Keep dev-only directories out of the published wheel/sdist.
 exclude = [
     { path = "benchmarks/**/*", format = ["wheel", "sdist"] },
