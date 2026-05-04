@@ -221,7 +221,9 @@ jobs:
           path: dist
 
   macos-x86_64:
-    if: github.event_name != 'pull_request'
+    # macos-13 (Intel) runners have long queue times on hosted free tier.
+    # Run only on manual dispatch; Intel-mac users install via sdist.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: macos-13
     steps:
       - uses: actions/checkout@v4
@@ -259,7 +261,7 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
-    needs: [linux, linux-aarch64, musllinux, windows, macos, macos-x86_64, sdist]
+    needs: [linux, linux-aarch64, musllinux, windows, macos, sdist]
     environment:
       name: pypi
       url: https://pypi.org/p/gilmap
